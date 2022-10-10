@@ -27,12 +27,12 @@ from localstack.utils import testutil
 from localstack.utils.aws import aws_stack
 from localstack.utils.aws.aws_stack import create_dynamodb_table
 from localstack.utils.aws.client import SigningHttpClient
-from localstack.utils.common import ensure_list, poll_condition, retry
-from localstack.utils.common import safe_requests as requests
-from localstack.utils.common import short_uid
+from localstack.utils.collections import ensure_list
 from localstack.utils.functions import run_safe
-from localstack.utils.generic.wait_utils import wait_until
+from localstack.utils.http import safe_requests as requests
 from localstack.utils.net import wait_for_port_open
+from localstack.utils.strings import short_uid
+from localstack.utils.sync import ShortCircuitWaitException, poll_condition, retry, wait_until
 from localstack.utils.testutil import start_http_server
 
 if TYPE_CHECKING:
@@ -70,6 +70,22 @@ if TYPE_CHECKING:
     from mypy_boto3_transcribe import TranscribeClient
 
 LOG = logging.getLogger(__name__)
+
+
+def is_pro_enabled() -> bool:
+    """Return whether the Pro extensions are enabled, i.e., restricted modules can be imported"""
+    try:
+        import localstack_ext.utils.common  # noqa
+
+        return True
+    except Exception:
+        return False
+
+
+# marker to indicate that a test should be skipped if the Pro extensions are enabled
+skip_if_pro_enabled = pytest.mark.skipif(
+    condition=is_pro_enabled(), reason="skipping, as Pro extensions are enabled"
+)
 
 
 def _client(service, region_name=None, *, additional_config=None):
@@ -809,23 +825,39 @@ def wait_for_dynamodb_stream_ready(dynamodbstreams_client):
 
 
 @pytest.fixture()
-def kms_create_key(kms_client):
+def kms_create_key(create_boto_client):
     key_ids = []
 
-    def _create_key(**kwargs):
+    def _create_key(region=None, **kwargs):
         if "Description" not in kwargs:
             kwargs["Description"] = f"test description - {short_uid()}"
-        if "KeyUsage" not in kwargs:
-            kwargs["KeyUsage"] = "ENCRYPT_DECRYPT"
-        key_metadata = kms_client.create_key(**kwargs)["KeyMetadata"]
-        key_ids.append(key_metadata["KeyId"])
+        key_metadata = create_boto_client("kms", region).create_key(**kwargs)["KeyMetadata"]
+        key_ids.append((region, key_metadata["KeyId"]))
         return key_metadata
 
     yield _create_key
 
-    for key_id in key_ids:
+    for region, key_id in key_ids:
         try:
-            kms_client.schedule_key_deletion(KeyId=key_id)
+            create_boto_client("kms", region).schedule_key_deletion(KeyId=key_id)
+        except Exception as e:
+            LOG.debug("error cleaning up KMS key %s: %s", key_id, e)
+
+
+@pytest.fixture()
+def kms_replicate_key(create_boto_client):
+    key_ids = []
+
+    def _replicate_key(region_from=None, **kwargs):
+        region_to = kwargs.get("ReplicaRegion")
+        key_ids.append((region_to, kwargs.get("KeyId")))
+        return create_boto_client("kms", region_from).replicate_key(**kwargs)
+
+    yield _replicate_key
+
+    for region_to, key_id in key_ids:
+        try:
+            create_boto_client("kms", region_to).schedule_key_deletion(KeyId=key_id)
         except Exception as e:
             LOG.debug("error cleaning up KMS key %s: %s", key_id, e)
 
@@ -854,6 +886,37 @@ def kms_create_alias(kms_client, kms_create_key):
             kms_client.delete_alias(AliasName=alias)
         except Exception as e:
             LOG.debug("error cleaning up KMS alias %s: %s", alias, e)
+
+
+@pytest.fixture()
+def kms_create_grant(kms_client, kms_create_key):
+    grants = []
+
+    def _create_grant(**kwargs):
+        # Just a random ARN, since KMS in LocalStack currently doesn't validate GranteePrincipal,
+        # but some GranteePrincipal is required to create a grant.
+        GRANTEE_PRINCIPAL_ARN = (
+            "arn:aws:kms:eu-central-1:123456789876:key/198a5a78-52c3-489f-ac70-b06a4d11027a"
+        )
+
+        if "Operations" not in kwargs:
+            kwargs["Operations"] = ["Decrypt", "Encrypt"]
+        if "GranteePrincipal" not in kwargs:
+            kwargs["GranteePrincipal"] = GRANTEE_PRINCIPAL_ARN
+        if "KeyId" not in kwargs:
+            kwargs["KeyId"] = kms_create_key()["KeyId"]
+
+        grant_id = kms_client.create_grant(**kwargs)["GrantId"]
+        grants.append((grant_id, kwargs["KeyId"]))
+        return grant_id, kwargs["KeyId"]
+
+    yield _create_grant
+
+    for grant_id, key_id in grants:
+        try:
+            kms_client.retire_grant(GrantId=grant_id, KeyId=key_id)
+        except Exception as e:
+            LOG.debug("error cleaning up KMS grant %s: %s", grant_id, e)
 
 
 @pytest.fixture
@@ -1038,7 +1101,6 @@ def deploy_cfn_template(
 
         assert wait_until(is_change_set_created_and_available(change_set_id), _max_wait=60)
         cfn_client.execute_change_set(ChangeSetName=change_set_id)
-        # TODO: potentially poll for ExecutionStatus=ROLLBACK_COMPLETE here as well, to catch errors early on
         assert wait_until(is_change_set_finished(change_set_id), _max_wait=max_wait or 60)
 
         outputs = cfn_client.describe_stacks(StackName=stack_id)["Stacks"][0].get("Outputs", [])
@@ -1146,6 +1208,11 @@ def is_change_set_finished(cfn_client):
                 kwargs["StackName"] = stack_name
 
             check_set = cfn_client.describe_change_set(**kwargs)
+
+            if check_set.get("ExecutionStatus") == "ROLLBACK_COMPLETE":
+                LOG.warning("Change set failed")
+                raise ShortCircuitWaitException()
+
             return check_set.get("ExecutionStatus") == "EXECUTE_COMPLETE"
 
         return _inner
@@ -1254,9 +1321,10 @@ def create_lambda_function_aws(
 
 
 @pytest.fixture
-def create_lambda_function(lambda_client, logs_client, iam_client, wait_until_lambda_ready):
+def create_lambda_function(
+    lambda_client, logs_client, iam_client, wait_until_lambda_ready, lambda_su_role
+):
     lambda_arns_and_clients = []
-    role_names_policy_arns = []
     log_groups = []
 
     def _create_lambda_function(*args, **kwargs):
@@ -1267,17 +1335,7 @@ def create_lambda_function(lambda_client, logs_client, iam_client, wait_until_la
         del kwargs["func_name"]
 
         if not kwargs.get("role"):
-            role_name = f"lambda-autogenerated-{short_uid()}"
-            role = iam_client.create_role(
-                RoleName=role_name, AssumeRolePolicyDocument=role_assume_policy
-            )["Role"]
-            policy_name = f"lambda-autogenerated-{short_uid()}"
-            policy_arn = iam_client.create_policy(
-                PolicyName=policy_name, PolicyDocument=role_policy
-            )["Policy"]["Arn"]
-            role_names_policy_arns.append((role_name, policy_arn))
-            iam_client.attach_role_policy(RoleName=role_name, PolicyArn=policy_arn)
-            kwargs["role"] = role["Arn"]
+            kwargs["role"] = lambda_su_role
 
         def _create_function():
             resp = testutil.create_lambda_function(func_name, **kwargs)
@@ -1298,17 +1356,6 @@ def create_lambda_function(lambda_client, logs_client, iam_client, wait_until_la
             client.delete_function(FunctionName=arn)
         except Exception:
             LOG.debug(f"Unable to delete function {arn=} in cleanup")
-
-    for role_name, policy_arn in role_names_policy_arns:
-        try:
-            iam_client.detach_role_policy(RoleName=role_name, PolicyArn=policy_arn)
-            iam_client.delete_role(RoleName=role_name)
-        except Exception:
-            LOG.debug(f"Unable to delete role {role_name=} in cleanup")
-        try:
-            iam_client.delete_policy(PolicyArn=policy_arn)
-        except Exception:
-            LOG.debug(f"Unable to delete policy {policy_arn=} in cleanup")
 
     for log_group_name in log_groups:
         try:

@@ -75,6 +75,8 @@ import base64
 import functools
 import json
 import logging
+import random
+import string
 from abc import ABC
 from binascii import crc32
 from datetime import datetime
@@ -89,7 +91,6 @@ from boto.utils import ISO8601
 from botocore.model import ListShape, MapShape, OperationModel, ServiceModel, Shape, StructureShape
 from botocore.serialize import ISO8601_MICRO
 from botocore.utils import calculate_md5, is_json_value_header, parse_to_aware_datetime
-from moto.core.utils import gen_amzn_requestid_long
 from werkzeug.datastructures import Headers, MIMEAccept
 from werkzeug.http import parse_accept_header
 
@@ -107,6 +108,8 @@ from localstack.utils.common import to_bytes, to_str
 from localstack.utils.xml import strip_xmlns
 
 LOG = logging.getLogger(__name__)
+
+REQUEST_ID_CHARACTERS = string.digits + string.ascii_uppercase
 
 
 class ResponseSerializerError(Exception):
@@ -1350,6 +1353,29 @@ class S3ResponseSerializer(RestXMLResponseSerializer):
     serialization.
     """
 
+    SUPPORTED_MIME_TYPES = [TEXT_XML, APPLICATION_XML]
+
+    def _serialize_response(
+        self,
+        parameters: dict,
+        response: HttpResponse,
+        shape: Optional[Shape],
+        shape_members: dict,
+        operation_model: OperationModel,
+        mime_type: str,
+    ) -> None:
+        header_params, payload_params = self._partition_members(parameters, shape)
+        self._process_header_members(header_params, response, shape)
+        # "HEAD" responses are basically "GET" responses without the actual body.
+        # Do not process the body payload in this case (setting a body could also manipulate the headers)
+        # If the response is a redirection, the body should be empty as well
+        if operation_model.http.get("method") != "HEAD" and not 300 <= response.status_code < 400:
+            self._serialize_payload(
+                payload_params, response, shape, shape_members, operation_model, mime_type
+            )
+        self._serialize_content_type(response, shape, shape_members, mime_type)
+        self._prepare_additional_traits_in_response(response, operation_model)
+
     def _serialize_error(
         self,
         error: ServiceException,
@@ -1370,6 +1396,35 @@ class S3ResponseSerializer(RestXMLResponseSerializer):
         self._add_additional_error_tags(error, root, shape, mime_type)
 
         response.set_response(self._encode_payload(self._node_to_string(root, mime_type)))
+
+    def _prepare_additional_traits_in_response(
+        self, response: HttpResponse, operation_model: OperationModel
+    ):
+        """Adds the request ID to the headers (in contrast to the body - as in the Query protocol)."""
+        response = super()._prepare_additional_traits_in_response(response, operation_model)
+        response.headers[
+            "x-amz-id-2"
+        ] = f"MzRISOwyjmnup{response.headers['x-amz-request-id']}7/JypPGXLh0OVFGcJaaO3KW/hRAqKOpIEEp"
+        return response
+
+    def _add_error_tags(
+        self, error: ServiceException, error_tag: ETree.Element, mime_type: str
+    ) -> None:
+        code_tag = ETree.SubElement(error_tag, "Code")
+        code_tag.text = error.code
+        message = self._get_error_message(error)
+        if message:
+            self._default_serialize(error_tag, message, None, "Message", mime_type)
+        else:
+            # In S3, if there's no message, create an empty node
+            self._create_empty_node(error_tag, "Message")
+        if error.sender_fault:
+            # The sender fault is either not set or "Sender"
+            self._default_serialize(error_tag, "Sender", None, "Type", mime_type)
+
+    @staticmethod
+    def _create_empty_node(xmlnode: ETree.Element, name: str) -> None:
+        ETree.SubElement(xmlnode, name)
 
 
 class SqsResponseSerializer(QueryResponseSerializer):
@@ -1408,6 +1463,10 @@ class SqsResponseSerializer(QueryResponseSerializer):
             if generated_string is not None
             else None
         )
+
+
+def gen_amzn_requestid_long():
+    return "".join([random.choice(REQUEST_ID_CHARACTERS) for _ in range(0, 52)])
 
 
 def create_serializer(service: ServiceModel) -> ResponseSerializer:

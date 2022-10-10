@@ -1,7 +1,7 @@
 ARG IMAGE_TYPE=full
 
 # java-builder: Stage to build a custom JRE (with jlink)
-FROM python:3.10.7-slim-buster@sha256:3e2f59423255b108729d6be55027552093b6edd8fff4e669b837ba3af225b747 as java-builder
+FROM python:3.10.7-slim-buster@sha256:7bb70ac0176d6a8bdabba60cd8ededd6494605f225365510f7ee5691a4004463 as java-builder
 ARG TARGETARCH
 
 # install OpenJDK 11
@@ -21,6 +21,8 @@ jdk.crypto.cryptoki,\
 jdk.zipfs,\
 # OpenSearch needs some jdk modules
 jdk.httpserver,jdk.management,\
+# MQ Broker requires management agent
+jdk.management.agent,\
 # Elasticsearch 7+ crashes without Thai Segmentation support
 jdk.localedata --include-locales en,th \
     --compress 2 --strip-debug --no-header-files --no-man-pages --output /usr/lib/jvm/java-11 && \
@@ -34,7 +36,7 @@ jdk.localedata --include-locales en,th \
 
 
 # base: Stage which installs necessary runtime dependencies (OS packages, java, maven,...)
-FROM python:3.10.7-slim-buster@sha256:3e2f59423255b108729d6be55027552093b6edd8fff4e669b837ba3af225b747 as base
+FROM python:3.10.7-slim-buster@sha256:7bb70ac0176d6a8bdabba60cd8ededd6494605f225365510f7ee5691a4004463 as base
 ARG TARGETARCH
 
 # Install runtime OS package dependencies
@@ -84,7 +86,7 @@ RUN mkdir -p /usr/share/maven /usr/share/maven/ref \
   && ln -s /usr/share/maven/bin/mvn /usr/bin/mvn
 ENV MAVEN_HOME /usr/share/maven
 ENV MAVEN_CONFIG "$USER_HOME_DIR/.m2"
-ADD https://raw.githubusercontent.com/carlossg/docker-maven/master/openjdk-11/settings-docker.xml /usr/share/maven/ref/
+ADD https://raw.githubusercontent.com/carlossg/docker-maven/9d82eaf48ee8b14ac15a36c431ba28b735e99c92/openjdk-11/settings-docker.xml /usr/share/maven/ref/
 
 # set workdir
 RUN mkdir -p /opt/code/localstack

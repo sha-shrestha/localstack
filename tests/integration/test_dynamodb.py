@@ -1089,7 +1089,7 @@ class TestDynamoDB:
     def test_transaction_write_canceled(
         self, dynamodb_create_table_with_parameters, dynamodb_client, snapshot
     ):
-        table_name = "table_%s" % short_uid()
+        table_name = f"table_{short_uid()}"
 
         # create table
         dynamodb_create_table_with_parameters(
@@ -1523,6 +1523,14 @@ class TestDynamoDB:
             )
         snapshot.match("ValidationException", ctx.value)
 
+    def test_batch_write_not_existing_table(self, dynamodb_client):
+        with pytest.raises(Exception) as ctx:
+            dynamodb_client.transact_write_items(
+                TransactItems=[{"Put": {"TableName": "non-existing-table", "Item": {}}}]
+            )
+        ctx.match("ResourceNotFoundException")
+        assert "retries" not in str(ctx)
+
     @pytest.mark.only_localstack
     def test_nosql_workbench_localhost_region(self, dynamodb_create_table, dynamodb_client):
         """Test for AWS NoSQL Workbench, which sends "localhost" as region in header"""
@@ -1535,6 +1543,60 @@ class TestDynamoDB:
         client = aws_stack.connect_to_service("dynamodb", region_name="localhost")
         table = client.describe_table(TableName=table_name)
         assert table.get("Table")
+
+    @pytest.mark.only_localstack(reason="wait_for_stream_ready of kinesis stream")
+    @pytest.mark.skip_snapshot_verify(paths=["$..eventID", "$..SequenceNumber", "$..SizeBytes"])
+    def test_data_encoding_consistency(
+        self,
+        dynamodbstreams_client,
+        dynamodb_create_table_with_parameters,
+        wait_for_stream_ready,
+        dynamodb_client,
+        snapshot,
+    ):
+        table_name = f"table-{short_uid()}"
+        table = dynamodb_create_table_with_parameters(
+            TableName=table_name,
+            KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
+            AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "S"}],
+            ProvisionedThroughput={"ReadCapacityUnits": 5, "WriteCapacityUnits": 5},
+            StreamSpecification={
+                "StreamEnabled": True,
+                "StreamViewType": "NEW_AND_OLD_IMAGES",
+            },
+        )
+        stream_name = get_kinesis_stream_name(table_name)
+        wait_for_stream_ready(stream_name)
+
+        # put item
+        dynamodb_client.put_item(
+            TableName=table_name, Item={"id": {"S": "id1"}, "data": {"B": b"\x90"}}
+        )
+
+        # get item
+        item = dynamodb_client.get_item(TableName=table_name, Key={PARTITION_KEY: {"S": "id1"}})[
+            "Item"
+        ]
+        snapshot.match("GetItem", item)
+
+        # get stream records
+        stream_arn = table["TableDescription"]["LatestStreamArn"]
+
+        result = dynamodbstreams_client.describe_stream(StreamArn=stream_arn)["StreamDescription"]
+
+        response = dynamodbstreams_client.get_shard_iterator(
+            StreamArn=stream_arn,
+            ShardId=result["Shards"][0]["ShardId"],
+            ShardIteratorType="AT_SEQUENCE_NUMBER",
+            SequenceNumber=result["Shards"][0]
+            .get("SequenceNumberRange")
+            .get("StartingSequenceNumber"),
+        )
+        records = dynamodbstreams_client.get_records(ShardIterator=response["ShardIterator"])[
+            "Records"
+        ]
+
+        snapshot.match("GetRecords", records[0]["dynamodb"])
 
 
 def delete_table(name):

@@ -1,6 +1,7 @@
 import copy
-import json
 import logging
+
+import bson
 
 from localstack.aws.api import RequestContext, handler
 from localstack.aws.api.dynamodbstreams import (
@@ -23,7 +24,7 @@ from localstack.aws.api.dynamodbstreams import (
     TableName,
 )
 from localstack.services.dynamodbstreams.dynamodbstreams_api import (
-    DynamoDBStreamsBackend,
+    get_dynamodbstreams_store,
     get_kinesis_stream_name,
     get_shard_id,
     kinesis_shard_id,
@@ -33,7 +34,6 @@ from localstack.services.dynamodbstreams.dynamodbstreams_api import (
 from localstack.services.plugins import ServiceLifecycleHook
 from localstack.utils.aws import aws_stack
 from localstack.utils.collections import select_from_typed_dict
-from localstack.utils.common import to_str
 
 LOG = logging.getLogger(__name__)
 
@@ -53,9 +53,9 @@ class DynamoDBStreamsProvider(DynamodbstreamsApi, ServiceLifecycleHook):
         limit: PositiveIntegerObject = None,
         exclusive_start_shard_id: ShardId = None,
     ) -> DescribeStreamOutput:
-        region = DynamoDBStreamsBackend.get()
+        store = get_dynamodbstreams_store(context.account_id, context.region)
         kinesis = aws_stack.connect_to_service("kinesis")
-        for stream in region.ddb_streams.values():
+        for stream in store.ddb_streams.values():
             if stream["StreamArn"] == stream_arn:
                 # get stream details
                 dynamodb = aws_stack.connect_to_service("dynamodb")
@@ -103,7 +103,7 @@ class DynamoDBStreamsProvider(DynamodbstreamsApi, ServiceLifecycleHook):
             "NextShardIterator": kinesis_records.get("NextShardIterator"),
         }
         for record in kinesis_records["Records"]:
-            record_data = json.loads(to_str(record["Data"]))
+            record_data = bson.loads(record["Data"])
             record_data["dynamodb"]["SequenceNumber"] = record["SequenceNumber"]
             result["Records"].append(record_data)
         return GetRecordsOutput(**result)
@@ -137,6 +137,6 @@ class DynamoDBStreamsProvider(DynamodbstreamsApi, ServiceLifecycleHook):
         limit: PositiveIntegerObject = None,
         exclusive_start_stream_arn: StreamArn = None,
     ) -> ListStreamsOutput:
-        region = DynamoDBStreamsBackend.get()
-        result = [select_from_typed_dict(Stream, res) for res in region.ddb_streams.values()]
+        store = get_dynamodbstreams_store(context.account_id, context.region)
+        result = [select_from_typed_dict(Stream, res) for res in store.ddb_streams.values()]
         return ListStreamsOutput(Streams=result)
