@@ -6,6 +6,7 @@ import pytest
 from botocore.awsrequest import prepare_request_dict
 from botocore.serialize import create_serializer
 
+from localstack import config
 from localstack.aws.protocol.parser import (
     OperationNotFoundParserError,
     ProtocolParserError,
@@ -301,6 +302,12 @@ def _botocore_parser_integration_test(
 
     operation_model = service.operation_model(action)
     serialized_request = serializer.serialize_to_request(kwargs, operation_model)
+
+    # botocore >= 1.28 might modify the url path of the request dict (specifically for S3).
+    # It will then set the original url path as "auth_path". If the auth_path is set, we reset the url_path.
+    if auth_path := serialized_request.get("auth_path"):
+        serialized_request["url_path"] = auth_path
+
     prepare_request_dict(serialized_request, "")
     split_url = urlsplit(serialized_request.get("url"))
     path = split_url.path
@@ -1098,6 +1105,9 @@ def test_restxml_header_date_parsing():
     )
 
 
+@pytest.mark.skipif(
+    not config.LEGACY_S3_PROVIDER, reason="ASF provider does not rely on virtual host parser"
+)
 def test_s3_virtual_host_addressing():
     """Test the parsing of an S3 bucket request using the bucket encoded in the domain."""
     request = HttpRequest(

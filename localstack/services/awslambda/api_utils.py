@@ -8,14 +8,22 @@ from typing import TYPE_CHECKING, Any, Optional
 from localstack.aws.api import lambda_ as api_spec
 from localstack.aws.api.lambda_ import (
     AliasConfiguration,
+    Architecture,
+    DeadLetterConfig,
     EnvironmentResponse,
     EphemeralStorage,
     FunctionConfiguration,
     FunctionUrlAuthType,
+    ImageConfig,
+    ImageConfigResponse,
     InvalidParameterValueException,
+    LayerVersionContentOutput,
+    PublishLayerVersionResponse,
     ResourceNotFoundException,
+    Runtime,
     TracingConfig,
 )
+from localstack.utils.collections import merge_recursive
 
 if TYPE_CHECKING:
     from localstack.services.awslambda.invocation.lambda_models import (
@@ -23,6 +31,7 @@ if TYPE_CHECKING:
         Function,
         FunctionUrlConfig,
         FunctionVersion,
+        LayerVersion,
         VersionAlias,
     )
     from localstack.services.awslambda.invocation.models import LambdaStore
@@ -31,6 +40,12 @@ if TYPE_CHECKING:
 FULL_FN_ARN_PATTERN = re.compile(
     r"^arn:aws:lambda:(?P<region_name>[^:]+):(?P<account_id>\d{12}):function:(?P<function_name>[^:]+)(:(?P<qualifier>.*))?$"
 )
+
+# Pattern for a full (both with and without qualifier) lambda function ARN
+LAYER_VERSION_ARN_PATTERN = re.compile(
+    r"^arn:aws:lambda:(?P<region_name>[^:]+):(?P<account_id>\d{12}):layer:(?P<layer_name>[^:]+)(:(?P<layer_version>\d+))?$"
+)
+
 
 # Pattern for a valid destination arn
 DESTINATION_ARN_PATTERN = re.compile(
@@ -47,6 +62,8 @@ HANDLER_REGEX = re.compile(r"[^\s]+")
 KMS_KEY_ARN_REGEX = re.compile(r"(arn:(aws[a-zA-Z-]*)?:[a-z0-9-.]+:.*)|()")
 # Pattern for a valid IAM role assumed by a lambda function
 ROLE_REGEX = re.compile(r"arn:(aws[a-zA-Z-]*)?:iam::\d{12}:role/?[a-zA-Z_0-9+=,.@\-_/]+")
+# Pattern for a valid AWS account
+AWS_ACCOUNT_REGEX = re.compile(r"\d{12}")
 # Pattern for a signing job arn
 SIGNING_JOB_ARN_REGEX = re.compile(
     r"arn:(aws[a-zA-Z0-9-]*):([a-zA-Z0-9\-])+:([a-z]{2}(-gov)?-[a-z]+-\d{1})?:(\d{12})?:(.*)"
@@ -55,15 +72,40 @@ SIGNING_JOB_ARN_REGEX = re.compile(
 SIGNING_PROFILE_VERSION_ARN_REGEX = re.compile(
     r"arn:(aws[a-zA-Z0-9-]*):([a-zA-Z0-9\-])+:([a-z]{2}(-gov)?-[a-z]+-\d{1})?:(\d{12})?:(.*)"
 )
+# Combined pattern for alias and version based on AWS error using "(|[a-zA-Z0-9$_-]+)"
+QUALIFIER_REGEX = re.compile(r"(^[a-zA-Z0-9$_-]+$)")
 # Pattern for a version qualifier
 VERSION_REGEX = re.compile(r"^[0-9]+$")
 # Pattern for an alias qualifier
-ALIAS_REGEX = re.compile(r"(?!^[0-9]+$)([a-zA-Z0-9-_]+)")
+# Rules: https://docs.aws.amazon.com/lambda/latest/dg/API_CreateAlias.html#SSS-CreateAlias-request-Name
+# The original regex from AWS misses ^ and $ in the second regex, which allowed for partial substring matches
+ALIAS_REGEX = re.compile(r"(?!^[0-9]+)(^[a-zA-Z0-9-_]+$)")
 
 
 URL_CHAR_SET = string.ascii_lowercase + string.digits
 # Date format as returned by the lambda service
 LAMBDA_DATE_FORMAT = "%Y-%m-%dT%H:%M:%S.%f+0000"
+
+RUNTIMES = [
+    Runtime.nodejs12_x,
+    Runtime.nodejs14_x,
+    Runtime.nodejs16_x,
+    Runtime.nodejs18_x,
+    Runtime.python3_7,
+    Runtime.python3_8,
+    Runtime.python3_9,
+    Runtime.ruby2_7,
+    Runtime.java8,
+    Runtime.java8_al2,
+    Runtime.java11,
+    Runtime.dotnetcore3_1,
+    Runtime.dotnet6,
+    Runtime.go1_x,
+    Runtime.provided,
+    Runtime.provided_al2,
+]
+
+ARCHITECTURES = [Architecture.arm64, Architecture.x86_64]
 
 
 def map_function_url_config(model: "FunctionUrlConfig") -> api_spec.FunctionUrlConfig:
@@ -103,6 +145,16 @@ def get_config_for_url(store: "LambdaStore", url_id: str) -> "Optional[FunctionU
             if fn_url_config.url_id == url_id:
                 return fn_url_config
     return None
+
+
+def is_qualifier_expression(qualifier: str) -> bool:
+    """Checks if a given qualifier is a syntactically accepted expression.
+    It is not necessarily a valid alias or version.
+
+    :param qualifier: Qualifier to check
+    :return True if syntactically accepted qualifier expression, false otherwise
+    """
+    return bool(QUALIFIER_REGEX.match(qualifier))
 
 
 def qualifier_is_version(qualifier: str) -> bool:
@@ -182,10 +234,10 @@ def build_statement(
     action: str,
     principal: str,
     source_arn: Optional[str] = None,
-    source_account: Optional[str] = None,  # TODO: test & implement
-    principal_org_id: Optional[str] = None,  # TODO: test & implement
-    event_source_token: Optional[str] = None,  # TODO: test & implement
-    auth_type: Optional[FunctionUrlAuthType] = None,  # TODO: test & implement
+    source_account: Optional[str] = None,
+    principal_org_id: Optional[str] = None,
+    event_source_token: Optional[str] = None,
+    auth_type: Optional[FunctionUrlAuthType] = None,
 ) -> dict[str, Any]:
     statement = {
         "Sid": statement_id,
@@ -194,14 +246,48 @@ def build_statement(
         "Resource": resource_arn,
     }
 
-    if "." in principal:  # TODO: better matching
-        # assuming service principal
+    # See AWS service principals for comprehensive docs:
+    # https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_elements_principal.html
+    # TODO: validate against actual list of IAM-supported AWS services (e.g., lambda.amazonaws.com)
+    if principal.endswith(".amazonaws.com"):
         statement["Principal"] = {"Service": principal}
+    elif is_aws_account(principal):
+        statement["Principal"] = {"AWS": f"arn:aws:iam::{principal}:root"}
+    # TODO: potentially validate against IAM?
+    elif principal.startswith("arn:aws:iam:"):
+        statement["Principal"] = {"AWS": principal}
+    elif principal == "*":
+        statement["Principal"] = principal
+    # TODO: unclear whether above matching is complete?
     else:
-        statement["Principal"] = principal  # TODO: verify
+        raise InvalidParameterValueException(
+            "The provided principal was invalid. Please check the principal and try again.",
+            Type="User",
+        )
+
+    condition = dict()
+    if auth_type:
+        update = {"StringEquals": {"lambda:FunctionUrlAuthType": auth_type}}
+        condition = merge_recursive(condition, update)
+
+    if principal_org_id:
+        update = {"StringEquals": {"aws:PrincipalOrgID": principal_org_id}}
+        condition = merge_recursive(condition, update)
+
+    if source_account:
+        update = {"StringEquals": {"AWS:SourceAccount": source_account}}
+        condition = merge_recursive(condition, update)
+
+    if event_source_token:
+        update = {"StringEquals": {"lambda:EventSourceToken": event_source_token}}
+        condition = merge_recursive(condition, update)
 
     if source_arn:
-        statement["Condition"] = {"ArnLike": {"AWS:SourceArn": source_arn}}
+        update = {"ArnLike": {"AWS:SourceArn": source_arn}}
+        condition = merge_recursive(condition, update)
+
+    if condition:
+        statement["Condition"] = condition
 
     return statement
 
@@ -271,6 +357,16 @@ def is_role_arn(role_arn: str) -> bool:
     return bool(ROLE_REGEX.match(role_arn))
 
 
+def is_aws_account(aws_account: str) -> bool:
+    """
+    Returns true if the provided string is an AWS account, false otherwise
+
+    :param role_arn: Potential AWS account
+    :return: Boolean indicating if input is an AWS account
+    """
+    return bool(AWS_ACCOUNT_REGEX.match(aws_account))
+
+
 def format_lambda_date(date_to_format: datetime.datetime) -> str:
     """Format a given datetime to a string generated with the lambda date format"""
     return date_to_format.strftime(LAMBDA_DATE_FORMAT)
@@ -322,10 +418,38 @@ def map_config_out(
 
     if version.config.architectures:
         optional_kwargs["Architectures"] = version.config.architectures
+
+    if version.config.dead_letter_arn:
+        optional_kwargs["DeadLetterConfig"] = DeadLetterConfig(
+            TargetArn=version.config.dead_letter_arn
+        )
+
     if version.config.environment is not None:
         optional_kwargs["Environment"] = EnvironmentResponse(
             Variables=version.config.environment
         )  # TODO: Errors key?
+
+    if version.config.layers:
+        optional_kwargs["Layers"] = [
+            {"Arn": layer.layer_version_arn, "CodeSize": layer.code.code_size}
+            for layer in version.config.layers
+        ]
+    if version.config.image_config:
+        image_config = ImageConfig()
+        if version.config.image_config.command:
+            image_config["Command"] = version.config.image_config.command
+        if version.config.image_config.entrypoint:
+            image_config["EntryPoint"] = version.config.image_config.entrypoint
+        if version.config.image_config.working_directory:
+            image_config["WorkingDirectory"] = version.config.image_config.working_directory
+        if image_config:
+            optional_kwargs["ImageConfigResponse"] = ImageConfigResponse(ImageConfig=image_config)
+    if version.config.code:
+        optional_kwargs["CodeSize"] = version.config.code.code_size
+        optional_kwargs["CodeSha256"] = version.config.code.code_sha256
+    elif version.config.image:
+        optional_kwargs["CodeSize"] = 0
+        optional_kwargs["CodeSha256"] = version.config.image.code_sha256
 
     func_conf = FunctionConfiguration(
         RevisionId=version.config.revision_id,
@@ -340,8 +464,6 @@ def map_config_out(
         Timeout=version.config.timeout,
         Runtime=version.config.runtime,
         Handler=version.config.handler,
-        CodeSize=version.config.code.code_size,
-        CodeSha256=version.config.code.code_sha256,
         MemorySize=version.config.memory_size,
         PackageType=version.config.package_type,
         TracingConfig=TracingConfig(Mode=version.config.tracing_config_mode),
@@ -384,3 +506,100 @@ def map_alias_out(alias: "VersionAlias", function: "Function") -> AliasConfigura
         RevisionId=alias.revision_id,
         **optional_kwargs,
     )
+
+
+def validate_and_set_batch_size(event_source_arn: str, batch_size: Optional[int] = None) -> int:
+    min_batch_size = 1
+
+    BATCH_SIZE_RANGES = {
+        "kafka": (100, 10_000),
+        "kinesis": (100, 10_000),
+        "dynamodb": (100, 1_000),
+        "sqs-fifo": (10, 10),
+        "sqs": (10, 10_000),
+        "mq": (100, 10_000),
+    }
+    svc = event_source_arn.split(":")[2]  # arn:<parition>:<svc>:<region>:...
+    if svc == "sqs" and "fifo" in event_source_arn:
+        svc = "sqs-fifo"
+    svc_range = BATCH_SIZE_RANGES.get(svc)
+
+    if svc_range:
+        default_batch_size, max_batch_size = svc_range
+
+        if batch_size is None:
+            batch_size = default_batch_size
+
+        if batch_size < min_batch_size or batch_size > max_batch_size:
+            raise InvalidParameterValueException("out of bounds todo", Type="User")  # TODO: test
+
+    return batch_size
+
+
+def map_layer_out(layer_version: "LayerVersion") -> PublishLayerVersionResponse:
+    return PublishLayerVersionResponse(
+        Content=LayerVersionContentOutput(
+            Location=layer_version.code.generate_presigned_url(),
+            CodeSha256=layer_version.code.code_sha256,
+            CodeSize=layer_version.code.code_size,
+            # SigningProfileVersionArn="", # same as in function configuration
+            # SigningJobArn="" # same as in function configuration
+        ),
+        LicenseInfo=layer_version.license_info,
+        Description=layer_version.description,
+        CompatibleArchitectures=layer_version.compatible_architectures,
+        CompatibleRuntimes=layer_version.compatible_runtimes,
+        CreatedDate=layer_version.created,
+        LayerArn=layer_version.layer_arn,
+        LayerVersionArn=layer_version.layer_version_arn,
+        Version=layer_version.version,
+    )
+
+
+def layer_arn(layer_name: str, account: str, region: str):
+    return f"arn:aws:lambda:{region}:{account}:layer:{layer_name}"
+
+
+def layer_version_arn(layer_name: str, account: str, region: str, version: str):
+    return f"arn:aws:lambda:{region}:{account}:layer:{layer_name}:{version}"
+
+
+def parse_layer_arn(layer_version_arn: str):
+    return LAYER_VERSION_ARN_PATTERN.match(layer_version_arn).group(
+        "region_name", "account_id", "layer_name", "layer_version"
+    )
+
+
+# TODO: save list of valid runtimes somewhere
+def validate_layer_runtime(compatible_runtime: str) -> str | None:
+    if compatible_runtime is not None and compatible_runtime not in RUNTIMES:
+        return f"Value '{compatible_runtime}' at 'compatibleRuntime' failed to satisfy constraint: Member must satisfy enum value set: [ruby2.6, dotnetcore1.0, python3.7, nodejs8.10, nasa, ruby2.7, python2.7-greengrass, dotnetcore2.0, python3.8, dotnet6, dotnetcore2.1, python3.9, java11, nodejs6.10, provided, dotnetcore3.1, java17, nodejs, nodejs4.3, java8.al2, go1.x, go1.9, byol, nodejs10.x, python3.10, java8, nodejs12.x, nodejs8.x, nodejs14.x, nodejs8.9, nodejs16.x, provided.al2, nodejs4.3-edge, nodejs18.x, python3.4, ruby2.5, python3.6, python2.7]"
+    return None
+
+
+def validate_layer_architecture(compatible_architecture: str) -> str | None:
+    if compatible_architecture is not None and compatible_architecture not in ARCHITECTURES:
+        return f"Value '{compatible_architecture}' at 'compatibleArchitecture' failed to satisfy constraint: Member must satisfy enum value set: [x86_64, arm64]"
+    return None
+
+
+def validate_layer_runtimes_and_architectures(
+    compatible_runtimes: list[str], compatible_architectures: list[str]
+):
+    validations = []
+
+    if compatible_runtimes and set(compatible_runtimes).difference(RUNTIMES):
+        constraint = "Member must satisfy enum value set: [nodejs12.x, provided, nodejs16.x, nodejs14.x, ruby2.7, java11, dotnet6, go1.x, nodejs18.x, provided.al2, java8, java8.al2, dotnetcore3.1, python3.7, python3.8, python3.9]"
+        validation_msg = f"Value '[{', '.join([s for s in compatible_runtimes])}]' at 'compatibleRuntimes' failed to satisfy constraint: {constraint}"
+        validations.append(validation_msg)
+
+    if compatible_architectures and set(compatible_architectures).difference(ARCHITECTURES):
+        constraint = "[Member must satisfy enum value set: [x86_64, arm64]]"
+        validation_msg = f"Value '[{', '.join([s for s in compatible_architectures])}]' at 'compatibleArchitectures' failed to satisfy constraint: Member must satisfy constraint: {constraint}"
+        validations.append(validation_msg)
+
+    return validations
+
+
+def is_layer_arn(layer_name: str) -> bool:
+    return LAYER_VERSION_ARN_PATTERN.match(layer_name) is not None

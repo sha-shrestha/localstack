@@ -34,8 +34,10 @@ from localstack.constants import APPLICATION_AMZ_JSON_1_1
 from localstack.services.events.models import EventsStore, events_stores
 from localstack.services.events.scheduler import JobScheduler
 from localstack.services.moto import call_moto
+from localstack.services.plugins import ServiceLifecycleHook
 from localstack.utils.aws import aws_stack
 from localstack.utils.aws.message_forwarding import send_event_to_target
+from localstack.utils.collections import pick_attributes
 from localstack.utils.common import TMP_FILES, mkdir, save_file, truncate
 from localstack.utils.json import extract_jsonpath
 from localstack.utils.strings import long_uid, short_uid
@@ -50,10 +52,15 @@ CONTENT_BASE_FILTER_KEYWORDS = ["prefix", "anything-but", "numeric", "cidr", "ex
 CONNECTION_NAME_PATTERN = re.compile("^[\\.\\-_A-Za-z0-9]+$")
 
 
-class EventsProvider(EventsApi):
+class EventsProvider(EventsApi, ServiceLifecycleHook):
     def __init__(self):
         apply_patches()
+
+    def on_before_start(self):
         JobScheduler.start()
+
+    def on_before_stop(self):
+        JobScheduler.shutdown()
 
     @staticmethod
     def get_store() -> EventsStore:
@@ -75,7 +82,7 @@ class EventsProvider(EventsApi):
                 # TODO generate event matching aws in case no Input has been specified
                 event_str = target.get("Input") or "{}"
                 event = json.loads(event_str)
-                attr = aws_stack.get_events_target_attributes(target)
+                attr = pick_attributes(target, ["$.SqsParameters", "$.KinesisParameters"])
                 try:
                     send_event_to_target(arn, event, target_attributes=attr, target=target)
                 except Exception as e:
@@ -428,7 +435,10 @@ def process_events(event: Dict, targets: List[Dict]):
             changed_event = json.loads(target.get("Input"))
         try:
             send_event_to_target(
-                arn, changed_event, aws_stack.get_events_target_attributes(target), target=target
+                arn,
+                changed_event,
+                pick_attributes(target, ["$.SqsParameters", "$.KinesisParameters"]),
+                target=target,
             )
         except Exception as e:
             LOG.info(f"Unable to send event notification {truncate(event)} to target {target}: {e}")

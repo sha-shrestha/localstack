@@ -322,12 +322,38 @@
     }
   },
   "tests/integration/s3/test_s3.py::TestS3::test_get_object_attributes": {
-    "recorded-date": "21-09-2022, 13:35:02",
+    "recorded-date": "06-10-2022, 19:45:18",
     "recorded-content": {
       "object-attrs": {
         "ETag": "e92499db864217242396e8ef766079a9",
         "LastModified": "datetime",
         "ObjectSize": 7,
+        "StorageClass": "STANDARD",
+        "ResponseMetadata": {
+          "HTTPHeaders": {},
+          "HTTPStatusCode": 200
+        }
+      },
+      "object-attrs-multiparts-1-part": {
+        "ETag": "e747540af6911dbc890f8d3e0b48549b-1",
+        "LastModified": "datetime",
+        "ObjectParts": {
+          "TotalPartsCount": 1
+        },
+        "ObjectSize": 65,
+        "StorageClass": "STANDARD",
+        "ResponseMetadata": {
+          "HTTPHeaders": {},
+          "HTTPStatusCode": 200
+        }
+      },
+      "object-attrs-multiparts-2-parts": {
+        "ETag": "5389a7fb9c7e4b97c90255e2ee5e57f7-2",
+        "LastModified": "datetime",
+        "ObjectParts": {
+          "TotalPartsCount": 2
+        },
+        "ObjectSize": 5242965,
         "StorageClass": "STANDARD",
         "ResponseMetadata": {
           "HTTPHeaders": {},
@@ -456,7 +482,7 @@
     }
   },
   "tests/integration/s3/test_s3.py::TestS3::test_get_object_after_deleted_in_versioned_bucket": {
-    "recorded-date": "21-09-2022, 13:35:18",
+    "recorded-date": "06-10-2022, 22:35:23",
     "recorded-content": {
       "get-object": {
         "AcceptRanges": "bytes",
@@ -466,7 +492,7 @@
         "ETag": "\"e8dc4081b13434b45189a720b77b6818\"",
         "LastModified": "datetime",
         "Metadata": {},
-        "VersionId": "tJEw7LZJ5OQQyUBbur6az2mmK7NnO1sy",
+        "VersionId": "<version-id:1>",
         "ResponseMetadata": {
           "HTTPHeaders": {},
           "HTTPStatusCode": 200
@@ -2219,33 +2245,6 @@
       }
     }
   },
-  "tests/integration/s3/test_s3.py::TestS3PresignedUrl::test_s3_get_response_headers": {
-    "recorded-date": "21-09-2022, 13:44:26",
-    "recorded-content": {
-      "bucket-cors-response": {
-        "CORSRules": [
-          {
-            "AllowedMethods": [
-              "GET",
-              "PUT",
-              "POST"
-            ],
-            "AllowedOrigins": [
-              "*"
-            ],
-            "ExposeHeaders": [
-              "ETag",
-              "x-amz-version-id"
-            ]
-          }
-        ],
-        "ResponseMetadata": {
-          "HTTPHeaders": {},
-          "HTTPStatusCode": 200
-        }
-      }
-    }
-  },
   "tests/integration/s3/test_s3.py::TestS3PresignedUrl::test_s3_copy_md5": {
     "recorded-date": "21-09-2022, 13:44:37",
     "recorded-content": {
@@ -3189,7 +3188,7 @@
     }
   },
   "tests/integration/s3/test_s3.py::TestS3PresignedUrl::test_s3_put_presigned_url_with_different_headers[s3]": {
-    "recorded-date": "22-09-2022, 14:02:07",
+    "recorded-date": "14-12-2022, 18:56:23",
     "recorded-content": {
       "content-type-exception": {
         "Error": {
@@ -3204,16 +3203,26 @@
         },
         "StatusCode": 403
       },
-      "content-encoding-response": {
-        "StatusCode": 200
+      "content-type-response": {
+        "Error": {
+          "AWSAccessKeyId": "<a-w-s-access-key-id:1>",
+          "Code": "SignatureDoesNotMatch",
+          "HostId": "host-id",
+          "Message": "The request signature we calculated does not match the signature you provided. Check your key and signing method.",
+          "RequestId": "<request-id:2>",
+          "SignatureProvided": "<signature-provided:2>",
+          "StringToSign": "<string-to-sign>",
+          "StringToSignBytes": "<string-to-sign-bytes:2>"
+        },
+        "StatusCode": 403
       },
-      "missing-content-encoding-response": {
+      "wrong-content-encoding-response": {
         "StatusCode": 200
       }
     }
   },
   "tests/integration/s3/test_s3.py::TestS3PresignedUrl::test_s3_put_presigned_url_with_different_headers[s3v4]": {
-    "recorded-date": "22-09-2022, 14:02:12",
+    "recorded-date": "14-12-2022, 18:56:29",
     "recorded-content": {
       "content-type-exception": {
         "Error": {
@@ -3230,7 +3239,10 @@
         },
         "StatusCode": 403
       },
-      "content-encoding-response": {
+      "content-type-response": {
+        "StatusCode": 200
+      },
+      "wrong-content-encoding-response": {
         "Error": {
           "AWSAccessKeyId": "<a-w-s-access-key-id:1>",
           "CanonicalRequest": "<canonical-request>",
@@ -3239,21 +3251,6 @@
           "HostId": "host-id",
           "Message": "The request signature we calculated does not match the signature you provided. Check your key and signing method.",
           "RequestId": "<request-id:2>",
-          "SignatureProvided": "<signature-provided:2>",
-          "StringToSign": "<string-to-sign>",
-          "StringToSignBytes": "<string-to-sign-bytes:2>"
-        },
-        "StatusCode": 403
-      },
-      "missing-content-encoding-response": {
-        "Error": {
-          "AWSAccessKeyId": "<a-w-s-access-key-id:1>",
-          "CanonicalRequest": "<canonical-request>",
-          "CanonicalRequestBytes": "<canonical-request-bytes:2>",
-          "Code": "SignatureDoesNotMatch",
-          "HostId": "host-id",
-          "Message": "The request signature we calculated does not match the signature you provided. Check your key and signing method.",
-          "RequestId": "<request-id:3>",
           "SignatureProvided": "<signature-provided:2>",
           "StringToSign": "<string-to-sign>",
           "StringToSignBytes": "<string-to-sign-bytes:2>"
@@ -3603,6 +3600,371 @@
       "no-such-bucket": "<html>\n<head><title>404 Not Found</title></head>\n<body>\n<h1>404 Not Found</h1>\n<ul>\n<li>Code: NoSuchBucket</li>\n<li>Message: The specified bucket does not exist</li>\n<li>BucketName: <bucket-name></li>\n<li>RequestId: <request-id></li>\n<li>HostId: <host-id></li>\n</ul>\n<hr/>\n</body>\n</html>\n",
       "no-such-website-config": "<html>\n<head><title>404 Not Found</title></head>\n<body>\n<h1>404 Not Found</h1>\n<ul>\n<li>Code: NoSuchWebsiteConfiguration</li>\n<li>Message: The specified bucket does not have a website configuration</li>\n<li>BucketName: <bucket-name></li>\n<li>RequestId: <request-id></li>\n<li>HostId: <host-id></li>\n</ul>\n<hr/>\n</body>\n</html>\n",
       "no-such-website-config-key": "<html>\n<head><title>404 Not Found</title></head>\n<body>\n<h1>404 Not Found</h1>\n<ul>\n<li>Code: NoSuchWebsiteConfiguration</li>\n<li>Message: The specified bucket does not have a website configuration</li>\n<li>BucketName: <bucket-name></li>\n<li>RequestId: <request-id></li>\n<li>HostId: <host-id></li>\n</ul>\n<hr/>\n</body>\n</html>\n"
+    }
+  },
+  "tests/integration/s3/test_s3.py::TestS3::test_multipart_and_list_parts": {
+    "recorded-date": "06-10-2022, 18:49:24",
+    "recorded-content": {
+      "create-multipart": {
+        "Bucket": "bucket",
+        "Key": "test-list-parts",
+        "UploadId": "<upload-id:1>",
+        "ResponseMetadata": {
+          "HTTPHeaders": {},
+          "HTTPStatusCode": 200
+        }
+      },
+      "list-part-after-created": {
+        "Bucket": "bucket",
+        "Initiator": {
+          "DisplayName": "display-name",
+          "ID": "owner-id"
+        },
+        "IsTruncated": false,
+        "Key": "test-list-parts",
+        "MaxParts": 1000,
+        "NextPartNumberMarker": 0,
+        "Owner": {
+          "DisplayName": "display-name",
+          "ID": "owner-id"
+        },
+        "PartNumberMarker": 0,
+        "StorageClass": "STANDARD",
+        "UploadId": "<upload-id:1>",
+        "ResponseMetadata": {
+          "HTTPHeaders": {},
+          "HTTPStatusCode": 200
+        }
+      },
+      "upload-part": {
+        "ETag": "\"3237c18681adb6a9d843c733ce249480\"",
+        "ResponseMetadata": {
+          "HTTPHeaders": {},
+          "HTTPStatusCode": 200
+        }
+      },
+      "list-part-after-upload": {
+        "Bucket": "bucket",
+        "Initiator": {
+          "DisplayName": "display-name",
+          "ID": "owner-id"
+        },
+        "IsTruncated": false,
+        "Key": "test-list-parts",
+        "MaxParts": 1000,
+        "NextPartNumberMarker": 1,
+        "Owner": {
+          "DisplayName": "display-name",
+          "ID": "owner-id"
+        },
+        "PartNumberMarker": 0,
+        "Parts": [
+          {
+            "ETag": "\"3237c18681adb6a9d843c733ce249480\"",
+            "LastModified": "datetime",
+            "PartNumber": 1,
+            "Size": 65
+          }
+        ],
+        "StorageClass": "STANDARD",
+        "UploadId": "<upload-id:1>",
+        "ResponseMetadata": {
+          "HTTPHeaders": {},
+          "HTTPStatusCode": 200
+        }
+      },
+      "complete-multipart": {
+        "Bucket": "bucket",
+        "ETag": "\"e747540af6911dbc890f8d3e0b48549b-1\"",
+        "Key": "test-list-parts",
+        "Location": "<location:1>",
+        "ResponseMetadata": {
+          "HTTPHeaders": {},
+          "HTTPStatusCode": 200
+        }
+      },
+      "list-part-after-complete-exc": {
+        "Error": {
+          "Code": "NoSuchUpload",
+          "Message": "The specified upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed.",
+          "UploadId": "<upload-id:1>"
+        },
+        "ResponseMetadata": {
+          "HTTPHeaders": {},
+          "HTTPStatusCode": 404
+        }
+      }
+    }
+  },
+  "tests/integration/s3/test_s3.py::TestS3Cors::test_s3_get_response_headers": {
+    "recorded-date": "24-10-2022, 15:57:19",
+    "recorded-content": {
+      "bucket-cors-response": {
+        "CORSRules": [
+          {
+            "AllowedMethods": [
+              "GET",
+              "PUT",
+              "POST"
+            ],
+            "AllowedOrigins": [
+              "*"
+            ],
+            "ExposeHeaders": [
+              "ETag",
+              "x-amz-version-id"
+            ]
+          }
+        ],
+        "ResponseMetadata": {
+          "HTTPHeaders": {},
+          "HTTPStatusCode": 200
+        }
+      }
+    }
+  },
+  "tests/integration/s3/test_s3.py::TestS3::test_put_and_get_object_with_content_language_disposition": {
+    "recorded-date": "18-10-2022, 10:25:38",
+    "recorded-content": {
+      "put-object": {
+        "ETag": "\"e99a18c428cb38d5f260853678922e03\"",
+        "ResponseMetadata": {
+          "HTTPHeaders": {},
+          "HTTPStatusCode": 200
+        }
+      },
+      "put-object-headers": {
+        "HTTPHeaders": {
+          "content-length": "0",
+          "date": "date",
+          "etag": "\"e99a18c428cb38d5f260853678922e03\"",
+          "server": "server",
+          "x-amz-id-2": "id-2",
+          "x-amz-request-id": "request-id"
+        },
+        "HTTPStatusCode": 200,
+        "HostId": "host-id",
+        "RequestId": "request-id",
+        "RetryAttempts": 0
+      },
+      "get-object": {
+        "AcceptRanges": "bytes",
+        "Body": "",
+        "CacheControl": "no-cache",
+        "ContentDisposition": "attachment; filename=\"foo.jpg\"",
+        "ContentLanguage": "de",
+        "ContentLength": 6,
+        "ContentType": "binary/octet-stream",
+        "ETag": "\"e99a18c428cb38d5f260853678922e03\"",
+        "LastModified": "datetime",
+        "Metadata": {},
+        "ResponseMetadata": {
+          "HTTPHeaders": {},
+          "HTTPStatusCode": 200
+        }
+      },
+      "get-object-headers": {
+        "HTTPHeaders": {
+          "accept-ranges": "bytes",
+          "cache-control": "no-cache",
+          "content-disposition": "attachment; filename=\"foo.jpg\"",
+          "content-language": "de",
+          "content-length": "6",
+          "content-type": "binary/octet-stream",
+          "date": "date",
+          "etag": "\"e99a18c428cb38d5f260853678922e03\"",
+          "last-modified": "last-modified",
+          "server": "server",
+          "x-amz-id-2": "id-2",
+          "x-amz-request-id": "request-id"
+        },
+        "HTTPStatusCode": 200,
+        "HostId": "host-id",
+        "RequestId": "request-id",
+        "RetryAttempts": 0
+      }
+    }
+  },
+  "tests/integration/s3/test_s3.py::TestS3::test_copy_object_kms": {
+    "recorded-date": "17-10-2022, 14:27:01",
+    "recorded-content": {
+      "get-object": {
+        "AcceptRanges": "bytes",
+        "Body": "hello world",
+        "ContentLength": 11,
+        "ContentType": "binary/octet-stream",
+        "ETag": "\"5eb63bbbe01eeed093cb22bb8f5acdc3\"",
+        "LastModified": "datetime",
+        "Metadata": {},
+        "ResponseMetadata": {
+          "HTTPHeaders": {},
+          "HTTPStatusCode": 200
+        }
+      },
+      "copy-object": {
+        "BucketKeyEnabled": true,
+        "CopyObjectResult": {
+          "ETag": "copy-etag",
+          "LastModified": "datetime"
+        },
+        "SSEKMSKeyId": "<key-id:1>",
+        "ServerSideEncryption": "aws:kms",
+        "ResponseMetadata": {
+          "HTTPHeaders": {},
+          "HTTPStatusCode": 200
+        }
+      },
+      "get-copied-object": {
+        "AcceptRanges": "bytes",
+        "Body": "hello world",
+        "BucketKeyEnabled": true,
+        "ContentLength": 11,
+        "ContentType": "binary/octet-stream",
+        "ETag": "etag",
+        "LastModified": "datetime",
+        "Metadata": {},
+        "SSEKMSKeyId": "<key-id:1>",
+        "ServerSideEncryption": "aws:kms",
+        "ResponseMetadata": {
+          "HTTPHeaders": {},
+          "HTTPStatusCode": 200
+        }
+      }
+    }
+  },
+  "tests/integration/s3/test_s3.py::TestS3::test_replication_config": {
+    "recorded-date": "18-10-2022, 14:49:15",
+    "recorded-content": {
+      "expected_error_no_replication_set": {
+        "Error": {
+          "BucketName": "<bucket-name:1>",
+          "Code": "ReplicationConfigurationNotFoundError",
+          "Message": "The replication configuration was not found"
+        },
+        "ResponseMetadata": {
+          "HTTPHeaders": {},
+          "HTTPStatusCode": 404
+        }
+      },
+      "expected_error_versioning_not_enabled": {
+        "Error": {
+          "Code": "InvalidRequest",
+          "Message": "Versioning must be 'Enabled' on the bucket to apply a replication configuration"
+        },
+        "ResponseMetadata": {
+          "HTTPHeaders": {},
+          "HTTPStatusCode": 400
+        }
+      },
+      "put-bucket-replication": {
+        "ResponseMetadata": {
+          "HTTPHeaders": {},
+          "HTTPStatusCode": 200
+        }
+      },
+      "get-bucket-replication": {
+        "ReplicationConfiguration": {
+          "Role": "role",
+          "Rules": [
+            {
+              "DeleteMarkerReplication": {
+                "Status": "Disabled"
+              },
+              "Destination": {
+                "Bucket": "dest-bucket"
+              },
+              "Filter": {
+                "Prefix": "Tax"
+              },
+              "ID": "id",
+              "Priority": 1,
+              "Status": "Enabled"
+            }
+          ]
+        },
+        "ResponseMetadata": {
+          "HTTPHeaders": {},
+          "HTTPStatusCode": 200
+        }
+      }
+    }
+  },
+  "tests/integration/s3/test_s3.py::TestS3::test_delete_non_existing_keys_quiet": {
+    "recorded-date": "19-10-2022, 10:11:26",
+    "recorded-content": {
+      "deleted-resp": {
+        "ResponseMetadata": {
+          "HTTPHeaders": {},
+          "HTTPStatusCode": 200
+        }
+      }
+    }
+  },
+  "tests/integration/s3/test_s3.py::TestS3::test_replication_config_without_filter": {
+    "recorded-date": "19-10-2022, 15:32:31",
+    "recorded-content": {
+      "expected_error_dest_does_not_exist": {
+        "Error": {
+          "Code": "InvalidRequest",
+          "Message": "Destination bucket must have versioning enabled."
+        },
+        "ResponseMetadata": {
+          "HTTPHeaders": {},
+          "HTTPStatusCode": 400
+        }
+      },
+      "expected_error_dest_versioning_disabled": {
+        "Error": {
+          "Code": "InvalidRequest",
+          "Message": "Destination bucket must have versioning enabled."
+        },
+        "ResponseMetadata": {
+          "HTTPHeaders": {},
+          "HTTPStatusCode": 400
+        }
+      },
+      "put-bucket-replication": {
+        "ResponseMetadata": {
+          "HTTPHeaders": {},
+          "HTTPStatusCode": 200
+        }
+      },
+      "get-bucket-replication": {
+        "ReplicationConfiguration": {
+          "Role": "role",
+          "Rules": [
+            {
+              "DeleteMarkerReplication": {
+                "Status": "Disabled"
+              },
+              "Destination": {
+                "Bucket": "dest-bucket",
+                "Metrics": {
+                  "EventThreshold": {
+                    "Minutes": 15
+                  },
+                  "Status": "Enabled"
+                },
+                "ReplicationTime": {
+                  "Status": "Enabled",
+                  "Time": {
+                    "Minutes": 15
+                  }
+                },
+                "StorageClass": "STANDARD"
+              },
+              "Filter": {},
+              "ID": "rtc",
+              "Priority": 0,
+              "Status": "Disabled"
+            }
+          ]
+        },
+        "ResponseMetadata": {
+          "HTTPHeaders": {},
+          "HTTPStatusCode": 200
+        }
+      }
     }
   }
 }

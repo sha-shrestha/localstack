@@ -3,6 +3,7 @@ import os
 import re
 import time
 from threading import Timer
+from typing import Dict
 
 import pytest
 import requests
@@ -13,7 +14,9 @@ from localstack.aws.accounts import get_aws_account_id
 from localstack.aws.api.lambda_ import Runtime
 from localstack.services.sqs.constants import DEFAULT_MAXIMUM_MESSAGE_SIZE
 from localstack.services.sqs.models import sqs_stores
-from localstack.utils.aws import aws_stack
+from localstack.services.sqs.provider import MAX_NUMBER_OF_MESSAGES
+from localstack.testing.snapshots.transformer import GenericTransformer
+from localstack.utils.aws import arns, aws_stack
 from localstack.utils.common import poll_condition, retry, short_uid, to_str
 
 from .awslambda.functions import lambda_integration
@@ -206,6 +209,20 @@ class TestSqsProvider:
         assert message["MD5OfBody"] == send_result["MD5OfMessageBody"]
 
     @pytest.mark.aws_validated
+    @pytest.mark.skip_snapshot_verify(paths=["$..Error.Detail"])
+    def test_send_receive_max_number_of_messages(self, sqs_client, sqs_queue, snapshot):
+        queue_url = sqs_queue
+        send_result = sqs_client.send_message(QueueUrl=queue_url, MessageBody="message")
+        assert send_result["MessageId"]
+
+        with pytest.raises(ClientError) as e:
+            sqs_client.receive_message(
+                QueueUrl=queue_url, MaxNumberOfMessages=MAX_NUMBER_OF_MESSAGES + 1
+            )
+
+        snapshot.match("send_max_number_of_messages", e.value.response)
+
+    @pytest.mark.aws_validated
     def test_receive_message_attributes_timestamp_types(self, sqs_client, sqs_queue):
         sqs_client.send_message(QueueUrl=sqs_queue, MessageBody="message")
 
@@ -299,8 +316,13 @@ class TestSqsProvider:
     @pytest.mark.skip_snapshot_verify(paths=["$..Error.Detail"])
     def test_send_oversized_message(self, sqs_client, sqs_queue, snapshot):
         with pytest.raises(ClientError) as e:
+            message_attributes = {"k": {"DataType": "String", "StringValue": "x"}}
+            message_attributes_size = len("k") + len("String") + len("x")
+            message_body = "a" * (DEFAULT_MAXIMUM_MESSAGE_SIZE - message_attributes_size + 1)
             sqs_client.send_message(
-                QueueUrl=sqs_queue, MessageBody="a" * (DEFAULT_MAXIMUM_MESSAGE_SIZE + 1)
+                QueueUrl=sqs_queue,
+                MessageBody=message_body,
+                MessageAttributes=message_attributes,
             )
 
         snapshot.match("send_oversized_message", e.value.response)
@@ -319,8 +341,13 @@ class TestSqsProvider:
 
         # check error case
         with pytest.raises(ClientError) as e:
+            message_attributes = {"k": {"DataType": "String", "StringValue": "x"}}
+            message_attributes_size = len("k") + len("String") + len("x")
+            message_body = "a" * (new_max_message_size - message_attributes_size + 1)
             sqs_client.send_message(
-                QueueUrl=sqs_queue, MessageBody="a" * (new_max_message_size + 1)
+                QueueUrl=sqs_queue,
+                MessageBody=message_body,
+                MessageAttributes=message_attributes,
             )
 
         snapshot.match("send_oversized_message", e.value.response)
@@ -331,10 +358,17 @@ class TestSqsProvider:
         # Send two messages, one of max message size and a second with
         # message body of size 1
         with pytest.raises(ClientError) as e:
+            message_attributes = {"k": {"DataType": "String", "StringValue": "x"}}
+            message_attributes_size = len("k") + len("String") + len("x")
+            message_body = "a" * (DEFAULT_MAXIMUM_MESSAGE_SIZE - message_attributes_size)
             sqs_client.send_message_batch(
                 QueueUrl=sqs_queue,
                 Entries=[
-                    {"Id": "1", "MessageBody": "a" * DEFAULT_MAXIMUM_MESSAGE_SIZE},
+                    {
+                        "Id": "1",
+                        "MessageBody": message_body,
+                        "MessageAttributes": message_attributes,
+                    },
                     {"Id": "2", "MessageBody": "a"},
                 ],
             )
@@ -353,10 +387,13 @@ class TestSqsProvider:
         )
 
         # batch send seems to ignore the MaximumMessageSize of the queue
+        message_attributes = {"k": {"DataType": "String", "StringValue": "x"}}
+        message_attributes_size = len("k") + len("String") + len("x")
+        message_body = "a" * (new_max_message_size - message_attributes_size)
         response = sqs_client.send_message_batch(
             QueueUrl=sqs_queue,
             Entries=[
-                {"Id": "1", "MessageBody": "a" * new_max_message_size},
+                {"Id": "1", "MessageBody": message_body, "MessageAttributes": message_attributes},
                 {"Id": "2", "MessageBody": "a"},
             ],
         )
@@ -1252,6 +1289,39 @@ class TestSqsProvider:
         assert "Messages" not in result_follow_up.keys()
 
     @pytest.mark.aws_validated
+    @pytest.mark.skip_snapshot_verify(paths=["$..Error.Detail"])
+    def test_too_many_entries_in_batch_request(self, sqs_client, sqs_create_queue, snapshot):
+        message_count = 20
+        queue_name = f"queue-{short_uid()}"
+        queue_url = sqs_create_queue(QueueName=queue_name)
+        message_batch = [
+            {
+                "Id": f"message-{i}",
+                "MessageBody": f"messageBody-{i}",
+            }
+            for i in range(message_count)
+        ]
+
+        with pytest.raises(ClientError) as e:
+            sqs_client.send_message_batch(QueueUrl=queue_url, Entries=message_batch)
+        snapshot.match("test_too_many_entries_in_batch_request", e.value.response)
+
+    @pytest.mark.aws_validated
+    @pytest.mark.skip_snapshot_verify(paths=["$..Error.Detail"])
+    def test_invalid_batch_id(self, sqs_client, sqs_create_queue, snapshot):
+        queue_name = f"queue-{short_uid()}"
+        queue_url = sqs_create_queue(QueueName=queue_name)
+        message_batch = [
+            {
+                "Id": f"message:{(batch_id:=short_uid())}",
+                "MessageBody": f"messageBody-{batch_id}",
+            }
+        ]
+        with pytest.raises(ClientError) as e:
+            sqs_client.send_message_batch(QueueUrl=queue_url, Entries=message_batch)
+        snapshot.match("test_invalid_batch_id", e.value.response)
+
+    @pytest.mark.aws_validated
     def test_publish_get_delete_message_batch(self, sqs_client, sqs_create_queue):
         message_count = 10
         queue_name = f"queue-{short_uid()}"
@@ -1297,6 +1367,23 @@ class TestSqsProvider:
             QueueUrl=queue_url, MaxNumberOfMessages=message_count
         )
         assert "Messages" not in confirmation.keys()
+
+    @pytest.mark.aws_validated
+    @pytest.mark.parametrize(
+        argnames="invalid_message_id", argvalues=["", "testLongId" * 10, "invalid:id"]
+    )
+    def test_delete_message_batch_invalid_msg_id(
+        self, invalid_message_id, sqs_create_queue, sqs_client, snapshot
+    ):
+        self._add_error_detail_transformer(snapshot)
+
+        queue_name = f"queue-{short_uid()}"
+        queue_url = sqs_create_queue(QueueName=queue_name)
+
+        delete_entries = [{"Id": invalid_message_id, "ReceiptHandle": "testHandle1"}]
+        with pytest.raises(ClientError) as e:
+            sqs_client.delete_message_batch(QueueUrl=queue_url, Entries=delete_entries)
+        snapshot.match("error_response", e.value.response)
 
     @pytest.mark.aws_validated
     def test_create_and_send_to_fifo_queue(self, sqs_client, sqs_create_queue):
@@ -1461,6 +1548,32 @@ class TestSqsProvider:
             QueueUrl=queue_url, MessageAttributeNames=["All"]
         )
         messages = result_receive["Messages"]
+
+        assert messages[0]["MessageId"] == result_send["MessageId"]
+        assert messages[0]["MessageAttributes"] == attributes
+        assert messages[0]["MD5OfMessageAttributes"] == result_send["MD5OfMessageAttributes"]
+
+    @pytest.mark.aws_validated
+    def test_send_message_with_binary_attributes(self, sqs_client, sqs_create_queue, snapshot):
+        # Old name: test_send_message_attributes
+        queue_name = f"queue-{short_uid()}"
+        queue_url = sqs_create_queue(QueueName=queue_name)
+
+        attributes = {
+            "attr1": {
+                "BinaryValue": b"traceparent\x1e00-774062d6c37081a5a0b9b5b88e30627c-2d2482211f6489da-01",
+                "DataType": "Binary",
+            },
+        }
+        result_send = sqs_client.send_message(
+            QueueUrl=queue_url, MessageBody="test", MessageAttributes=attributes
+        )
+
+        result_receive = sqs_client.receive_message(
+            QueueUrl=queue_url, MessageAttributeNames=["All"]
+        )
+        messages = result_receive["Messages"]
+        snapshot.match("binary-attrs-msg", result_receive)
 
         assert messages[0]["MessageId"] == result_send["MessageId"]
         assert messages[0]["MessageAttributes"] == attributes
@@ -1675,7 +1788,7 @@ class TestSqsProvider:
         )
         message_id = response["MessageId"]
 
-        # receive the messages twice, which is the maximum allwed
+        # receive the messages twice, which is the maximum allowed
         sqs_client.receive_message(QueueUrl=queue_url, WaitTimeSeconds=1, VisibilityTimeout=0)
         sqs_client.receive_message(QueueUrl=queue_url, WaitTimeSeconds=1, VisibilityTimeout=0)
         # after this receive call the message should be in the DLQ
@@ -1700,9 +1813,7 @@ class TestSqsProvider:
 
         # create arn
         url_parts = dl_queue_url.split("/")
-        dl_target_arn = aws_stack.sqs_queue_arn(
-            url_parts[-1], account_id=url_parts[len(url_parts) - 2]
-        )
+        dl_target_arn = arns.sqs_queue_arn(url_parts[-1], account_id=url_parts[len(url_parts) - 2])
 
         policy = {"deadLetterTargetArn": dl_target_arn, "maxReceiveCount": 1}
         queue_url = sqs_create_queue(
@@ -1731,12 +1842,12 @@ class TestSqsProvider:
         queue_names = [f"q-{short_uid()}", f"q-{short_uid()}", f"q-{short_uid()}"]
         for queue_name in queue_names:
             sqs_create_queue(QueueName=queue_name, Attributes={"VisibilityTimeout": "0"})
-        queue_urls = [aws_stack.get_sqs_queue_url(queue_name) for queue_name in queue_names]
+        queue_urls = [arns.get_sqs_queue_url(queue_name) for queue_name in queue_names]
 
         # set redrive policies
         for idx, queue_name in enumerate(queue_names[:2]):
             policy = {
-                "deadLetterTargetArn": aws_stack.sqs_queue_arn(queue_names[idx + 1]),
+                "deadLetterTargetArn": arns.sqs_queue_arn(queue_names[idx + 1]),
                 "maxReceiveCount": 1,
             }
             sqs_client.set_queue_attributes(
@@ -2611,6 +2722,16 @@ class TestSqsProvider:
         sqs_client.delete_message(QueueUrl=sqs_queue, ReceiptHandle=handle)
 
     # TODO: test message attributes and message system attributes
+
+    def _add_error_detail_transformer(self, snapshot):
+        """Adds a transformer to ignore {"Error": {"Detail": None, ...}} entries in snapshot error responses"""
+
+        def _remove_error_details(snapshot_content: Dict, *args) -> Dict:
+            for response in snapshot_content.values():
+                response.get("Error", {}).pop("Detail", None)
+            return snapshot_content
+
+        snapshot.add_transformer(GenericTransformer(_remove_error_details))
 
 
 def get_region():

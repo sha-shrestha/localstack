@@ -262,7 +262,7 @@ class MultiplexingClusterManager(ClusterManager):
                     LOG.info("starting %s on %s", type(self.cluster), self.cluster.url)
                     self.cluster.start()  # start may block during install
 
-                start_thread(_start_async)
+                start_thread(_start_async, name="opensearch-multiplex")
             cluster_endpoint = ClusterEndpoint(self.cluster, EndpointProxy(url, self.cluster.url))
             self.clusters[arn] = cluster_endpoint
             return cluster_endpoint
@@ -298,7 +298,9 @@ class MultiClusterManager(ClusterManager):
             if engine_type == EngineType.OpenSearch:
                 return OpensearchCluster(port=port, host=EDGE_BIND_HOST, arn=arn, version=version)
             else:
-                return ElasticsearchCluster(port=port, host=LOCALHOST, arn=arn, version=version)
+                return ElasticsearchCluster(
+                    port=port, host=EDGE_BIND_HOST, arn=arn, version=version
+                )
 
 
 class SingletonClusterManager(ClusterManager):

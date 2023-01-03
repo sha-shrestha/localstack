@@ -177,6 +177,8 @@ StringToSignBytes = str
 CanonicalRequest = str
 CanonicalRequestBytes = str
 X_Amz_Expires = int
+HttpMethod = str
+ResourceType = str
 
 
 class AnalyticsS3ExportFileFormat(str):
@@ -198,6 +200,7 @@ class BucketCannedACL(str):
     public_read = "public-read"
     public_read_write = "public-read-write"
     authenticated_read = "authenticated-read"
+    log_delivery_write = "log-delivery-write"
 
 
 class BucketLocationConstraint(str):
@@ -209,6 +212,7 @@ class BucketLocationConstraint(str):
     ap_south_1 = "ap-south-1"
     ap_southeast_1 = "ap-southeast-1"
     ap_southeast_2 = "ap-southeast-2"
+    ap_southeast_3 = "ap-southeast-3"
     ca_central_1 = "ca-central-1"
     cn_north_1 = "cn-north-1"
     cn_northwest_1 = "cn-northwest-1"
@@ -600,6 +604,7 @@ class NoSuchUpload(ServiceException):
     code: str = "NoSuchUpload"
     sender_fault: bool = False
     status_code: int = 400
+    UploadId: Optional[MultipartUploadId]
 
 
 class ObjectAlreadyInActiveTierError(ServiceException):
@@ -692,6 +697,36 @@ class AuthorizationQueryParametersError(ServiceException):
 
 class NoSuchWebsiteConfiguration(ServiceException):
     code: str = "NoSuchWebsiteConfiguration"
+    sender_fault: bool = False
+    status_code: int = 404
+    BucketName: Optional[BucketName]
+
+
+class ReplicationConfigurationNotFoundError(ServiceException):
+    code: str = "ReplicationConfigurationNotFoundError"
+    sender_fault: bool = False
+    status_code: int = 404
+    BucketName: Optional[BucketName]
+
+
+class BadRequest(ServiceException):
+    code: str = "BadRequest"
+    sender_fault: bool = False
+    status_code: int = 400
+    HostId: Optional[HostId]
+
+
+class AccessForbidden(ServiceException):
+    code: str = "AccessForbidden"
+    sender_fault: bool = False
+    status_code: int = 403
+    HostId: Optional[HostId]
+    Method: Optional[HttpMethod]
+    ResourceType: Optional[ResourceType]
+
+
+class NoSuchCORSConfiguration(ServiceException):
+    code: str = "NoSuchCORSConfiguration"
     sender_fault: bool = False
     status_code: int = 404
     BucketName: Optional[BucketName]

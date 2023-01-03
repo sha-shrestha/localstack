@@ -1,4 +1,3 @@
-import base64
 import copy
 import hashlib
 import json
@@ -6,6 +5,7 @@ import logging
 import re
 import threading
 import time
+from concurrent.futures.thread import ThreadPoolExecutor
 from queue import Empty
 from typing import Dict, List, Optional
 
@@ -14,7 +14,7 @@ from moto.sqs.models import Message as MotoMessage
 
 from localstack import config
 from localstack.aws.accounts import get_aws_account_id
-from localstack.aws.api import RequestContext
+from localstack.aws.api import CommonServiceException, RequestContext, ServiceException
 from localstack.aws.api.sqs import (
     ActionNameList,
     AttributeNameList,
@@ -34,6 +34,7 @@ from localstack.aws.api.sqs import (
     GetQueueUrlResult,
     Integer,
     InvalidAttributeName,
+    InvalidBatchEntryId,
     InvalidMessageContents,
     ListDeadLetterSourceQueuesResult,
     ListQueuesResult,
@@ -59,8 +60,13 @@ from localstack.aws.api.sqs import (
     TagKeyList,
     TagMap,
     Token,
+    TooManyEntriesInBatchRequest,
 )
+from localstack.aws.protocol.serializer import create_serializer
 from localstack.aws.spec import load_service
+from localstack.config import SQS_DISABLE_MAX_NUMBER_OF_MESSAGE_LIMIT
+from localstack.http import Request, Response, route
+from localstack.services.edge import ROUTER
 from localstack.services.plugins import ServiceLifecycleHook
 from localstack.services.sqs import constants as sqs_constants
 from localstack.services.sqs.exceptions import InvalidParameterValue
@@ -73,9 +79,11 @@ from localstack.services.sqs.models import (
     StandardQueue,
     sqs_stores,
 )
-from localstack.services.sqs.utils import generate_message_id
+from localstack.services.sqs.utils import generate_message_id, parse_queue_url
 from localstack.utils.aws import aws_stack
-from localstack.utils.aws.aws_stack import parse_arn
+from localstack.utils.aws.arns import parse_arn
+from localstack.utils.aws.request_context import extract_region_from_headers
+from localstack.utils.cloudwatch.cloudwatch_util import publish_sqs_metric
 from localstack.utils.run import FuncThread
 from localstack.utils.scheduler import Scheduler
 from localstack.utils.strings import md5
@@ -83,6 +91,15 @@ from localstack.utils.threads import start_thread
 from localstack.utils.time import now
 
 LOG = logging.getLogger(__name__)
+
+MAX_NUMBER_OF_MESSAGES = 10
+
+
+class InvalidAddress(ServiceException):
+    code = "InvalidAddress"
+    message = "The address https://queue.amazonaws.com/ is not valid for this endpoint."
+    sender_fault = True
+    status_code = 404
 
 
 def assert_queue_name(queue_name: str, fifo: bool = False):
@@ -102,14 +119,37 @@ def assert_queue_name(queue_name: str, fifo: bool = False):
         )
 
 
-def check_message_size(message_body: str, max_message_size: int):
+def check_message_size(
+    message_body: str, message_attributes: MessageBodyAttributeMap, max_message_size: int
+):
     # https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/quotas-messages.html
     error = "One or more parameters are invalid. "
     error += f"Reason: Message must be shorter than {max_message_size} bytes."
 
-    # must encode as utf8 to get correct bytes with len
-    if len(message_body.encode("utf8")) > max_message_size:
+    if (
+        _message_body_size(message_body) + _message_attributes_size(message_attributes)
+        > max_message_size
+    ):
         raise InvalidParameterValue(error)
+
+
+def _message_body_size(body: str):
+    return _bytesize(body)
+
+
+def _message_attributes_size(attributes: MessageBodyAttributeMap):
+    if not attributes:
+        return 0
+    message_attributes_keys_size = sum(_bytesize(k) for k in attributes.keys())
+    message_attributes_values_size = sum(
+        sum(_bytesize(v) for v in attr.values()) for attr in attributes.values()
+    )
+    return message_attributes_keys_size + message_attributes_values_size
+
+
+def _bytesize(value: str | bytes):
+    # must encode as utf8 to get correct bytes with len
+    return len(value.encode("utf8")) if isinstance(value, str) else len(value)
 
 
 def check_message_content(message_body: str):
@@ -117,6 +157,153 @@ def check_message_content(message_body: str):
 
     if not re.match(sqs_constants.MSG_CONTENT_REGEX, message_body):
         raise InvalidMessageContents(error)
+
+
+class CloudwatchDispatcher:
+    """
+    Dispatches SQS metrics for specific api-calls using a ThreadPool
+    """
+
+    def __init__(self, num_thread: int = 3):
+        self.executor = ThreadPoolExecutor(
+            num_thread, thread_name_prefix="sqs-metrics-cloudwatch-dispatcher"
+        )
+
+    def shutdown(self):
+        self.executor.shutdown(wait=False)
+
+    def dispatch_sqs_metric(
+        self, region: str, queue_name: str, metric: str, value: float = 1, unit: str = "Count"
+    ):
+        """
+        Publishes a metric to Cloudwatch using a Threadpool
+        :param region The region that should be used for Cloudwatch client
+        :param queue_name The name of the queue that the metric belongs to
+        :param metric The name of the metric
+        :param value The value for that metric, default 1
+        :param unit The unit for the value, default "Count"
+        """
+        self.executor.submit(
+            publish_sqs_metric,
+            region=region,
+            queue_name=queue_name,
+            metric=metric,
+            value=value,
+            unit=unit,
+        )
+
+    def dispatch_metric_message_sent(self, queue: SqsQueue, message_body_size: int):
+        """
+        Sends metric 'NumberOfMessagesSent' and 'SentMessageSize' to Cloudwatch
+        :param queue The Queue for which the metric will be send
+        :param message_body_size the size of the message in bytes
+        """
+        self.dispatch_sqs_metric(
+            region=queue.region, queue_name=queue.name, metric="NumberOfMessagesSent"
+        )
+        self.dispatch_sqs_metric(
+            region=queue.region,
+            queue_name=queue.name,
+            metric="SentMessageSize",
+            value=message_body_size,
+            unit="Bytes",
+        )
+
+    def dispatch_metric_message_deleted(self, queue: SqsQueue, deleted: int = 1):
+        """
+        Sends metric 'NumberOfMessagesDeleted' to Cloudwatch
+        :param queue The Queue for which the metric will be sent
+        :param deleted The number of messages that were successfully deleted, default: 1
+        """
+        self.dispatch_sqs_metric(
+            region=queue.region,
+            queue_name=queue.name,
+            metric="NumberOfMessagesDeleted",
+            value=deleted,
+        )
+
+    def dispatch_metric_received(self, queue: SqsQueue, received: int):
+        """
+        Sends metric 'NumberOfMessagesReceived' (if received > 0), or 'NumberOfEmptyReceives' to Cloudwatch
+        :param queue The Queue for which the metric will be send
+        :param received The number of messages that have been received
+        """
+        if received > 0:
+            self.dispatch_sqs_metric(
+                region=queue.region,
+                queue_name=queue.name,
+                metric="NumberOfMessagesReceived",
+                value=received,
+            )
+        else:
+            self.dispatch_sqs_metric(
+                region=queue.region, queue_name=queue.name, metric="NumberOfEmptyReceives"
+            )
+
+
+class CloudwatchPublishWorker:
+    """
+    Regularly publish metrics data about approximate messages to Cloudwatch.
+    Includes: ApproximateNumberOfMessagesVisible, ApproximateNumberOfMessagesNotVisible
+        and ApproximateNumberOfMessagesDelayed
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.scheduler = Scheduler()
+        self.thread: Optional[FuncThread] = None
+
+    def publish_approximate_cloudwatch_metrics(self):
+        for account_id, region_bundle in sqs_stores.items():
+            for region, store in region_bundle.items():
+                for queue in store.queues.values():
+                    self.publish_approximate_metrics_for_queue_to_cloudwatch(queue)
+
+    def publish_approximate_metrics_for_queue_to_cloudwatch(self, queue):
+        """Publishes the metrics for ApproximateNumberOfMessagesVisible, ApproximateNumberOfMessagesNotVisible
+        and ApproximateNumberOfMessagesDelayed to CloudWatch"""
+        # TODO ApproximateAgeOfOldestMessage is missing
+        #  https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-available-cloudwatch-metrics.html
+        publish_sqs_metric(
+            region=queue.region,
+            queue_name=queue.name,
+            metric="ApproximateNumberOfMessagesVisible",
+            value=queue.approx_number_of_messages,
+        )
+        publish_sqs_metric(
+            region=queue.region,
+            queue_name=queue.name,
+            metric="ApproximateNumberOfMessagesNotVisible",
+            value=queue.approx_number_of_messages_not_visible,
+        )
+        publish_sqs_metric(
+            region=queue.region,
+            queue_name=queue.name,
+            metric="ApproximateNumberOfMessagesDelayed",
+            value=queue.approx_number_of_messages_delayed,
+        )
+
+    def start(self):
+        if self.thread:
+            return
+
+        self.scheduler = Scheduler()
+        self.scheduler.schedule(self.publish_approximate_cloudwatch_metrics, period=60)
+
+        def _run(*_args):
+            self.scheduler.run()
+
+        self.thread = start_thread(_run, name="sqs-approx-metrics-cloudwatch-publisher")
+
+    def stop(self):
+        if self.scheduler:
+            self.scheduler.close()
+
+        if self.thread:
+            self.thread.stop()
+
+        self.thread = None
+        self.scheduler = None
 
 
 class QueueUpdateWorker:
@@ -156,7 +343,7 @@ class QueueUpdateWorker:
             def _run(*_args):
                 self.scheduler.run()
 
-            self.thread = start_thread(_run)
+            self.thread = start_thread(_run, name="sqs-queue-update-worker")
 
     def stop(self):
         with self.mutex:
@@ -232,6 +419,127 @@ def check_fifo_id(fifo_id):
         )
 
 
+class SqsDeveloperEndpoints:
+    """
+    A set of SQS developer tool endpoints:
+
+    - ``/_aws/sqs/messages``: list SQS messages without side effects, compatible with ``ReceiveMessage``.
+    """
+
+    def __init__(self, stores=None):
+        self.stores = stores or sqs_stores
+        self.service = load_service("sqs")
+        self.serializer = create_serializer(self.service)
+
+    @route("/_aws/sqs/messages")
+    def list_messages(self, request: Request):
+        """
+        This endpoint expects a ``QueueUrl`` request parameter (either as query arg or form parameter), similar to
+        the ``ReceiveMessage`` operation. It will parse the Queue URL generated by one of the SQS endpoint strategies.
+        """
+        if "Action" in request.values and request.values["Action"] != "ReceiveMessage":
+            return self.serializer.serialize_error_to_response(
+                CommonServiceException(
+                    "InvalidRequest", "This endpoint only accepts ReceiveMessage calls"
+                ),
+                self.service.operation_model("ReceiveMessage"),
+                request.headers,
+            )
+
+        try:
+            region, account_id, queue_name = parse_queue_url(request.values["QueueUrl"])
+        except ValueError:
+            LOG.exception("Error while parsing Queue URL from request values: %s", request.values)
+            return self.serializer.serialize_error_to_response(
+                InvalidAddress(), self.service.operation_model("ReceiveMessage"), request.headers
+            )
+        if not region:
+            region = extract_region_from_headers(request.headers)
+        return self._get_and_serialize_messages(request, region, account_id, queue_name)
+
+    @route("/_aws/sqs/messages/<region>/<account_id>/<queue_name>")
+    def list_messages_for_queue_url(
+        self, request: Request, region: str, account_id: str, queue_name: str
+    ) -> Response:
+        """
+        This endpoint extracts the region, account_id, and queue_name directly from the URL rather than requiring the
+        QueueUrl as parameter.
+        """
+        if "Action" in request.values and request.values["Action"] != "ReceiveMessage":
+            return self.serializer.serialize_error_to_response(
+                CommonServiceException(
+                    "InvalidRequest", "This endpoint only accepts ReceiveMessage calls"
+                ),
+                self.service.operation_model("ReceiveMessage"),
+                request.headers,
+            )
+
+        return self._get_and_serialize_messages(request, region, account_id, queue_name)
+
+    def _get_and_serialize_messages(
+        self, request: Request, region: str, account_id: str, queue_name: str
+    ) -> Response:
+        try:
+            store = self.stores[account_id or get_aws_account_id()][
+                region or aws_stack.get_region()
+            ]
+            queue = store.queues[queue_name]
+        except KeyError:
+            LOG.info(
+                "no queue named %s in region %s and account %s", queue_name, region, account_id
+            )
+            return self.serializer.serialize_error_to_response(
+                QueueDoesNotExist(), self.service.operation_model("ReceiveMessage"), request.headers
+            )
+
+        messages = self._collect_visible_messages(queue)
+        return self.serializer.serialize_to_response(
+            ReceiveMessageResult(Messages=messages),
+            self.service.operation_model("ReceiveMessage"),
+            request.headers,
+        )
+
+    def _collect_visible_messages(self, queue: SqsQueue) -> List[Message]:
+        """
+        Retrieves from a given SqsQueue all visible messages without causing any side-effects (not setting any
+        receive timestamps, receive counts, or visibility state).
+
+        FIXME: There's a bit of code-duplication here with the two layers of receive_message calls, which we
+         should consolidate at some point.
+
+        :param queue: the queue
+        :return: a list of messages
+        """
+        receipt_handle = "SQS/BACKDOOR/ACCESS"  # dummy receipt handle
+
+        messages = []
+
+        for sqs_message in queue.visible.queue:
+            message: Message = copy.deepcopy(sqs_message.message)
+            messages.append(message)
+
+            message["Attributes"][MessageSystemAttributeName.ApproximateReceiveCount] = str(
+                sqs_message.receive_times
+            )
+            message["Attributes"][
+                MessageSystemAttributeName.ApproximateFirstReceiveTimestamp
+            ] = str(int((sqs_message.first_received or time.time()) * 1000))
+            message["ReceiptHandle"] = receipt_handle
+
+            message_filter_attributes(message, [QueueAttributeName.All])
+            message_filter_message_attributes(message, ["All"])
+
+            if message.get("MessageAttributes"):
+                message["MD5OfMessageAttributes"] = _create_message_attribute_hash(
+                    message["MessageAttributes"]
+                )
+            else:
+                # delete the value that was computed when creating the message
+                message.pop("MD5OfMessageAttributes")
+
+        return messages
+
+
 class SqsProvider(SqsApi, ServiceLifecycleHook):
     """
     LocalStack SQS Provider.
@@ -248,16 +556,26 @@ class SqsProvider(SqsApi, ServiceLifecycleHook):
         super().__init__()
         self._mutex = threading.RLock()
         self._queue_update_worker = QueueUpdateWorker()
+        self._cloudwatch_publish_worker = CloudwatchPublishWorker()
+        self._cloudwatch_dispatcher = CloudwatchDispatcher()
+        self._router_rules = []
 
     @staticmethod
     def get_store(account_id: str = None, region: str = None) -> SqsStore:
         return sqs_stores[account_id or get_aws_account_id()][region or aws_stack.get_region()]
 
     def on_before_start(self):
+        self._router_rules = ROUTER.add_route_endpoints(SqsDeveloperEndpoints())
         self._queue_update_worker.start()
+        self._cloudwatch_publish_worker.start()
 
     def on_before_stop(self):
+        for rule in self._router_rules:
+            ROUTER.remove_rule(rule)
+
         self._queue_update_worker.stop()
+        self._cloudwatch_publish_worker.stop()
+        self._cloudwatch_dispatcher.shutdown()
 
     def _require_queue(self, context: RequestContext, name: str) -> SqsQueue:
         """
@@ -494,7 +812,7 @@ class SqsProvider(SqsApi, ServiceLifecycleHook):
 
         # Have to check the message size here, rather than in _put_message
         # to avoid multiple calls for batch messages.
-        check_message_size(message_body, queue.maximum_message_size)
+        check_message_size(message_body, message_attributes, queue.maximum_message_size)
 
         queue_item = self._put_message(
             queue,
@@ -519,6 +837,11 @@ class SqsProvider(SqsApi, ServiceLifecycleHook):
         self, context: RequestContext, queue_url: String, entries: SendMessageBatchRequestEntryList
     ) -> SendMessageBatchResult:
         queue = self._resolve_queue(context, queue_url=queue_url)
+
+        if entries and (no_entries := len(entries)) > 10:
+            raise TooManyEntriesInBatchRequest(
+                f"Maximum number of entries per request are 10. You have sent {no_entries}."
+            )
 
         self._assert_batch(entries)
         # check the total batch size first and raise BatchRequestTooLong id > DEFAULT_MAXIMUM_MESSAGE_SIZE.
@@ -597,6 +920,10 @@ class SqsProvider(SqsApi, ServiceLifecycleHook):
             MessageAttributes=message_attributes,
         )
 
+        self._cloudwatch_dispatcher.dispatch_metric_message_sent(
+            queue=queue, message_body_size=len(message_body.encode("utf-8"))
+        )
+
         return queue.put(
             message=message,
             message_deduplication_id=message_deduplication_id,
@@ -621,6 +948,18 @@ class SqsProvider(SqsApi, ServiceLifecycleHook):
             wait_time_seconds = queue.wait_time_seconds
 
         num = max_number_of_messages or 1
+
+        # backdoor to get all messages
+        if num == -1:
+            num = queue.visible.qsize()
+        elif (
+            num < 1 or num > MAX_NUMBER_OF_MESSAGES
+        ) and not SQS_DISABLE_MAX_NUMBER_OF_MESSAGE_LIMIT:
+            raise InvalidParameterValue(
+                f"Value {num} for parameter MaxNumberOfMessages is invalid. "
+                f"Reason: Must be between 1 and 10, if provided."
+            )
+
         block = True if wait_time_seconds else False
         # collect messages
         messages = []
@@ -667,6 +1006,8 @@ class SqsProvider(SqsApi, ServiceLifecycleHook):
             # add message to result
             messages.append(msg)
             num -= 1
+
+        self._cloudwatch_dispatcher.dispatch_metric_received(queue, received=len(messages))
 
         # TODO: how does receiving behave if the queue was deleted in the meantime?
         return ReceiveMessageResult(Messages=messages)
@@ -716,6 +1057,7 @@ class SqsProvider(SqsApi, ServiceLifecycleHook):
     ) -> None:
         queue = self._resolve_queue(context, queue_url=queue_url)
         queue.remove(receipt_handle)
+        self._cloudwatch_dispatcher.dispatch_metric_message_deleted(queue)
 
     def delete_message_batch(
         self,
@@ -725,6 +1067,7 @@ class SqsProvider(SqsApi, ServiceLifecycleHook):
     ) -> DeleteMessageBatchResult:
         queue = self._resolve_queue(context, queue_url=queue_url)
         self._assert_batch(entries)
+        self._assert_valid_message_ids(entries)
 
         successful = []
         failed = []
@@ -743,6 +1086,7 @@ class SqsProvider(SqsApi, ServiceLifecycleHook):
                             Message=str(e),
                         )
                     )
+        self._cloudwatch_dispatcher.dispatch_metric_message_deleted(queue, deleted=len(successful))
 
         return DeleteMessageBatchResult(
             Successful=successful,
@@ -876,23 +1220,41 @@ class SqsProvider(SqsApi, ServiceLifecycleHook):
                     "WSDL for a list of valid actions. "
                 )
 
-    def _assert_batch(self, batch: List):
+    def _assert_batch(self, batch: List) -> None:
         if not batch:
             raise EmptyBatchRequest
         visited = set()
         for entry in batch:
-            # TODO: InvalidBatchEntryId
-            if entry["Id"] in visited:
+            entry_id = entry["Id"]
+            if not re.search(r"^[\w-]+$", entry_id) or len(entry_id) > 80:
+                raise InvalidBatchEntryId(
+                    "A batch entry id can only contain alphanumeric characters, hyphens and underscores. "
+                    "It can be at most 80 letters long."
+                )
+            if entry_id in visited:
                 raise BatchEntryIdsNotDistinct()
             else:
-                visited.add(entry["Id"])
+                visited.add(entry_id)
 
     def _assert_valid_batch_size(self, batch: List, max_message_size: int):
-        batch_message_size = sum([len(entry.get("MessageBody").encode("utf8")) for entry in batch])
+        batch_message_size = sum(
+            _message_body_size(entry.get("MessageBody"))
+            + _message_attributes_size(entry.get("MessageAttributes"))
+            for entry in batch
+        )
         if batch_message_size > max_message_size:
             error = f"Batch requests cannot be longer than {max_message_size} bytes."
             error += f" You have sent {batch_message_size} bytes."
             raise BatchRequestTooLong(error)
+
+    def _assert_valid_message_ids(self, batch: List):
+        batch_id_regex = r"^[\w-]{1,80}$"
+        for message in batch:
+            if not re.match(batch_id_regex, message.get("Id", "")):
+                raise InvalidBatchEntryId(
+                    "A batch entry id can only contain alphanumeric characters, "
+                    "hyphens and underscores. It can be at most 80 letters long."
+                )
 
 
 # Method from moto's attribute_md5 of moto/sqs/models.py, separated from the Message Object
@@ -916,7 +1278,7 @@ def _create_message_attribute_hash(message_attributes) -> Optional[str]:
             )
         elif attr_value.get("BinaryValue"):
             hash.update(bytearray([BINARY_TYPE_FIELD_INDEX]))
-            decoded_binary_value = base64.b64decode(attr_value.get("BinaryValue"))
+            decoded_binary_value = attr_value.get("BinaryValue")
             MotoMessage.update_binary_length_and_value(hash, decoded_binary_value)
         # string_list_value, binary_list_value type is not implemented, reserved for the future use.
         # See https://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_MessageAttributeValue.html

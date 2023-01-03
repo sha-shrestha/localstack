@@ -9,6 +9,7 @@ import pytest
 import requests
 
 from localstack.aws.accounts import get_aws_account_id
+from localstack.aws.api.lambda_ import Runtime
 from localstack.aws.api.secretsmanager import (
     CreateSecretRequest,
     CreateSecretResponse,
@@ -16,8 +17,7 @@ from localstack.aws.api.secretsmanager import (
     DeleteSecretResponse,
     ListSecretsResponse,
 )
-from localstack.services.awslambda.lambda_utils import LAMBDA_RUNTIME_PYTHON36
-from localstack.utils import testutil
+from localstack.testing.aws.lambda_utils import is_new_provider
 from localstack.utils.aws import aws_stack
 from localstack.utils.collections import select_from_typed_dict
 from localstack.utils.strings import short_uid
@@ -34,7 +34,7 @@ RESOURCE_POLICY = {
     "Statement": [
         {
             "Effect": "Allow",
-            "Principal": {"AWS": "arn:aws:iam::%s:root" % get_aws_account_id()},
+            "Principal": {"AWS": f"arn:aws:iam::{get_aws_account_id()}:root"},
             "Action": "secretsmanager:GetSecretValue",
             "Resource": "*",
         }
@@ -309,18 +309,21 @@ class TestSecretsManager:
         # clean up
         sm_client.delete_secret(SecretId=secret_name, ForceDeleteWithoutRecovery=True)
 
-    def test_rotate_secret_with_lambda_1(self, sm_client, secret_name):
-        sm_client.create_secret(
+    @pytest.mark.skip(condition=is_new_provider(), reason="needs lambda usage rework")
+    def test_rotate_secret_with_lambda_1(
+        self, sm_client, lambda_client, secret_name, create_secret, create_lambda_function
+    ):
+        create_secret(
             Name=secret_name,
             SecretString="my_secret",
             Description="testing rotation of secrets",
         )
 
-        function_name = "s-%s" % short_uid()
-        function_arn = testutil.create_lambda_function(
+        function_name = f"s-{short_uid()}"
+        function_arn = create_lambda_function(
             handler_file=TEST_LAMBDA_PYTHON_VERSION,
             func_name=function_name,
-            runtime=LAMBDA_RUNTIME_PYTHON36,
+            runtime=Runtime.python3_9,
         )["CreateFunctionResponse"]["FunctionArn"]
 
         response = sm_client.rotate_secret(
@@ -334,12 +337,11 @@ class TestSecretsManager:
 
         assert response["ResponseMetadata"]["HTTPStatusCode"] == 200
 
-        # clean up
-        sm_client.delete_secret(SecretId=secret_name, ForceDeleteWithoutRecovery=True)
-        testutil.delete_lambda_function(function_name)
-
-    def test_rotate_secret_with_lambda_2(self, sm_client, secret_name):
-        cre_res = sm_client.create_secret(
+    @pytest.mark.skipif(condition=is_new_provider(), reason="needs lambda usage rework")
+    def test_rotate_secret_with_lambda_2(
+        self, sm_client, secret_name, create_lambda_function, create_secret
+    ):
+        cre_res = create_secret(
             Name=secret_name,
             SecretString="init",
             Description="testing rotation of secrets",
@@ -347,10 +349,10 @@ class TestSecretsManager:
         version_id_0 = cre_res["VersionId"]
 
         function_name = f"rotate-func-{short_uid()}"
-        function_arn = testutil.create_lambda_function(
+        function_arn = create_lambda_function(
             handler_file=TEST_LAMBDA_ROTATE_SECRET,
             func_name=function_name,
-            runtime=LAMBDA_RUNTIME_PYTHON36,
+            runtime=Runtime.python3_9,
         )["CreateFunctionResponse"]["FunctionArn"]
 
         rot_res = sm_client.rotate_secret(
@@ -419,10 +421,6 @@ class TestSecretsManager:
         assert get_res["VersionId"] == version_id_2
         secret_string_2 = lambda_rotate_secret.secret_of_rotation_from_version_id(version_id_2)
         assert get_res["SecretString"] == secret_string_2
-
-        # clean up
-        sm_client.delete_secret(SecretId=secret_name, ForceDeleteWithoutRecovery=True)
-        testutil.delete_lambda_function(function_name)
 
     def test_rotate_secret_invalid_lambda_arn(self, sm_client, secret_name):
         sm_client.create_secret(Name=secret_name, SecretString="init")
@@ -1777,3 +1775,75 @@ class TestSecretsManager:
         sm_snapshot.match("create_secret_res_1", create_secret_res_1)
 
         sm_client.delete_secret(**stage_deletion_req)
+
+    @pytest.mark.aws_validated
+    def test_secret_exists(self, sm_client, cleanups):
+        secret_name = short_uid()
+        cleanups.append(
+            lambda: sm_client.delete_secret(SecretId=secret_name, ForceDeleteWithoutRecovery=True)
+        )
+        description = "Testing secret already exists."
+        rs = sm_client.create_secret(
+            Name=secret_name,
+            SecretString="my_secret_{}".format(secret_name),
+            Description=description,
+        )
+        self._wait_created_is_listed(sm_client, secret_id=secret_name)
+        secret_arn = rs["ARN"]
+        secret_id = rs["Name"]
+        assert len(secret_arn.rpartition("-")[-1]) == 6
+
+        ls = sm_client.list_secrets()
+        secrets = {
+            secret["Name"]: secret["ARN"]
+            for secret in ls["SecretList"]
+            if secret["Name"] == secret_name
+        }
+        assert len(secrets.keys()) == 1
+        assert secret_arn in secrets.values()
+
+        with pytest.raises(sm_client.exceptions.ResourceExistsException) as res_exists_ex:
+            sm_client.create_secret(
+                Name=secret_name,
+                SecretString="my_secret_{}".format(secret_name),
+                Description=description,
+            )
+        assert res_exists_ex.typename == "ResourceExistsException"
+        assert res_exists_ex.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+        assert (
+            res_exists_ex.value.response["Error"]["Message"]
+            == f"The operation failed because the secret {secret_id} already exists."
+        )
+
+        # clean up
+        sm_client.delete_secret(SecretId=secret_name, ForceDeleteWithoutRecovery=True)
+
+    @pytest.mark.aws_validated
+    def test_secret_exists_snapshots(self, sm_client, sm_snapshot, cleanups):
+        secret_name = short_uid()
+        cleanups.append(
+            lambda: sm_client.delete_secret(SecretId=secret_name, ForceDeleteWithoutRecovery=True)
+        )
+
+        description = "Snapshot testing secret already exists."
+        rs = sm_client.create_secret(
+            Name=secret_name,
+            SecretString="my_secret_{}".format(secret_name),
+            Description=description,
+        )
+        self._wait_created_is_listed(sm_client, secret_id=secret_name)
+        sm_snapshot.add_transformers_list(sm_snapshot.transform.secretsmanager_secret_id_arn(rs, 0))
+
+        with pytest.raises(sm_client.exceptions.ResourceExistsException) as res_exists_ex:
+            sm_client.create_secret(
+                Name=secret_name,
+                SecretString="my_secret_{}".format(secret_name),
+                Description=description,
+            )
+        sm_snapshot.match("ex_log", res_exists_ex.value.response)
+
+        # clean up
+        delete_secret_res = sm_client.delete_secret(
+            SecretId=secret_name, ForceDeleteWithoutRecovery=True
+        )
+        sm_snapshot.match("delete_secret_res", delete_secret_res)

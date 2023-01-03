@@ -17,13 +17,14 @@ import xmltodict
 from botocore.client import ClientError
 from moto.s3.exceptions import InvalidFilterRuleName, MissingBucket
 from moto.s3.models import FakeBucket
-from pytz import timezone
 from requests.models import Request, Response
 
 from localstack import config, constants
 from localstack.aws.api import CommonServiceException
 from localstack.config import get_protocol as get_service_protocol
 from localstack.services.generic_proxy import ProxyListener
+from localstack.services.generic_proxy import append_cors_headers as _append_default_cors_headers
+from localstack.services.generic_proxy import is_cors_origin_allowed
 from localstack.services.s3 import multipart_content
 from localstack.services.s3.s3_utils import (
     ALLOWED_HEADER_OVERRIDES,
@@ -41,7 +42,8 @@ from localstack.services.s3.s3_utils import (
     uses_host_addressing,
     validate_bucket_name,
 )
-from localstack.utils.aws import aws_stack
+from localstack.services.s3.utils import is_key_expired
+from localstack.utils.aws import arns, aws_stack
 from localstack.utils.aws.aws_responses import (
     create_sqs_system_attributes,
     is_invalid_html_response,
@@ -351,10 +353,10 @@ def send_notification_for_subscriber(
     message = json.dumps(message)
 
     if notification.get("Queue"):
-        region = aws_stack.extract_region_from_arn(notification["Queue"])
+        region = arns.extract_region_from_arn(notification["Queue"])
         sqs_client = aws_stack.connect_to_service("sqs", region_name=region)
         try:
-            queue_url = aws_stack.sqs_queue_url_for_arn(notification["Queue"])
+            queue_url = arns.sqs_queue_url_for_arn(notification["Queue"])
             sqs_client.send_message(
                 QueueUrl=queue_url,
                 MessageBody=message,
@@ -365,7 +367,7 @@ def send_notification_for_subscriber(
                 f"Unable to send notification for S3 bucket \"{bucket_name}\" to SQS queue \"{notification['Queue']}\": {e}",
             )
     if notification.get("Topic"):
-        region = aws_stack.extract_region_from_arn(notification["Topic"])
+        region = arns.extract_region_from_arn(notification["Topic"])
         sns_client = aws_stack.connect_to_service("sns", region_name=region)
         try:
             sns_client.publish(
@@ -381,7 +383,7 @@ def send_notification_for_subscriber(
     lambda_function_config = notification.get("CloudFunction") or notification.get("LambdaFunction")
     if lambda_function_config:
         # make sure we don't run into a socket timeout
-        region = aws_stack.extract_region_from_arn(lambda_function_config)
+        region = arns.extract_region_from_arn(lambda_function_config)
         connection_config = botocore.config.Config(read_timeout=300)
         lambda_client = aws_stack.connect_to_service(
             "lambda", config=connection_config, region_name=region
@@ -597,17 +599,21 @@ def append_cors_headers(
     if request_method == "OPTIONS" and "Access-Control-Request-Method" in request_headers:
         request_method = request_headers["Access-Control-Request-Method"]
 
+    # Strip all CORS headers (moto return allow-all by default)
+    for header in CORS_HEADERS:
+        if header in response.headers:
+            del response.headers[header]
+
     # Checking CORS is allowed or not
     try:
         cors = BackendState.cors_config(bucket_name)
         assert cors
     except Exception:
-        return
 
-    # Cleaning headers
-    for header in CORS_HEADERS:
-        if header in response.headers:
-            del response.headers[header]
+        # add default LocalStack CORS if the bucket is not configured and the origin is allowed
+        if is_cors_origin_allowed(request_headers):
+            _append_default_cors_headers(request_headers=request_headers, response=response)
+        return
 
     # Fetching origin of the request
     origin = get_origin_host(request_headers)
@@ -682,13 +688,7 @@ def add_accept_range_header(response):
 def is_object_expired(bucket_name: str, key: str) -> bool:
     bucket = BackendState.get_bucket(bucket_name)
     key_obj = bucket.keys.get(key)
-    if not key_obj or not key_obj._expiry:
-        return False
-    tzname = key_obj._expiry.tzname()
-    if not tzname:
-        return False
-    tzone = timezone(tzname)
-    return key_obj._expiry <= datetime.datetime.now(tzone)
+    return is_key_expired(key_obj)
 
 
 def set_object_expiry(bucket_name: str, key: str, headers: Dict[str, str]):

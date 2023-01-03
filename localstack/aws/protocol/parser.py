@@ -87,6 +87,7 @@ from werkzeug.exceptions import BadRequest, NotFound
 
 from localstack.aws.api import HttpRequest
 from localstack.aws.protocol.op_router import RestServiceOperationRouter
+from localstack.config import LEGACY_S3_PROVIDER
 
 
 def _text_content(func):
@@ -1048,9 +1049,31 @@ class S3RequestParser(RestXMLRequestParser):
 
     @_handle_exceptions
     def parse(self, request: HttpRequest) -> Tuple[OperationModel, Any]:
-        """Handle virtual-host-addressing for S3."""
-        with self.VirtualHostRewriter(request):
+        if LEGACY_S3_PROVIDER:
+            """Handle virtual-host-addressing for S3."""
+            with self.VirtualHostRewriter(request):
+                return super().parse(request)
+        else:
             return super().parse(request)
+
+    def _parse_shape(
+        self, request: HttpRequest, shape: Shape, node: Any, uri_params: Mapping[str, Any] = None
+    ) -> Any:
+        """
+        Special handling of parsing the shape for s3 object-names (=key):
+        trailing '/' are valid and need to be preserved, however, the url-matcher removes it from the key
+        we check the request.url to verify the name
+        """
+        if (
+            shape is not None
+            and uri_params is not None
+            and shape.serialization.get("location") == "uri"
+            and shape.serialization.get("name") == "Key"
+            and request.base_url.endswith(f"{uri_params['Key']}/")
+        ):
+            uri_params = dict(uri_params)
+            uri_params["Key"] = uri_params["Key"] + "/"
+        return super()._parse_shape(request, shape, node, uri_params)
 
 
 class SQSRequestParser(QueryRequestParser):

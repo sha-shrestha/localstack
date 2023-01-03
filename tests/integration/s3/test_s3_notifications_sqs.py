@@ -9,7 +9,7 @@ from boto3.s3.transfer import KB, TransferConfig
 from botocore.exceptions import ClientError
 
 from localstack.config import LEGACY_S3_PROVIDER
-from localstack.utils.aws import aws_stack
+from localstack.utils.aws import arns
 from localstack.utils.strings import short_uid
 from localstack.utils.sync import poll_condition, retry
 
@@ -53,7 +53,7 @@ def get_queue_arn(sqs_client, queue_url: str) -> str:
 def set_policy_for_queue(sqs_client, queue_url, bucket_name):
     queue_arn = get_queue_arn(sqs_client, queue_url)
     assert queue_arn
-    bucket_arn = aws_stack.s3_bucket_arn(bucket_name)
+    bucket_arn = arns.s3_bucket_arn(bucket_name)
 
     policy = {
         "Version": "2012-10-17",
@@ -303,6 +303,49 @@ class TestS3NotificationsToSQS:
         assert events[2]["eventName"] == "ObjectRemoved:Delete"
         assert events[2]["s3"]["bucket"]["name"] == bucket_name
         assert events[2]["s3"]["object"]["key"] == src_key
+
+    @pytest.mark.skipif(condition=LEGACY_S3_PROVIDER, reason="Not implemented in old provider")
+    @pytest.mark.aws_validated
+    def test_delete_objects(
+        self,
+        s3_client,
+        sqs_client,
+        s3_create_bucket,
+        sqs_create_queue,
+        s3_create_sqs_bucket_notification,
+        snapshot,
+    ):
+        snapshot.add_transformer(snapshot.transform.sqs_api())
+        snapshot.add_transformer(snapshot.transform.s3_api())
+        snapshot.add_transformer(snapshot.transform.jsonpath("$..s3.object.key", "object-key"))
+
+        # setup fixture
+        bucket_name = s3_create_bucket()
+        queue_url = sqs_create_queue()
+        s3_create_sqs_bucket_notification(bucket_name, queue_url, ["s3:ObjectRemoved:*"])
+
+        key = "key-%s" % short_uid()
+
+        s3_client.put_object(Bucket=bucket_name, Key=key, Body="something")
+
+        # event3 = DeleteObject
+        s3_client.delete_objects(
+            Bucket=bucket_name,
+            Delete={
+                "Objects": [{"Key": key}, {"Key": "dummy1"}, {"Key": "dummy2"}],
+                "Quiet": True,
+            },
+        )
+
+        # delete_objects behaves like it deletes non-existing objects as well -> also events are triggered
+        events = sqs_collect_s3_events(sqs_client, queue_url, 3)
+        assert len(events) == 3, f"unexpected number of events in {events}"
+        events.sort(key=lambda x: x["s3"]["object"]["key"])
+
+        snapshot.match("receive_messages", {"messages": events})
+        assert events[2]["eventName"] == "ObjectRemoved:Delete"
+        assert events[2]["s3"]["bucket"]["name"] == bucket_name
+        assert events[2]["s3"]["object"]["key"] == key
 
     @pytest.mark.aws_validated
     @pytest.mark.skip_snapshot_verify(
@@ -845,7 +888,7 @@ class TestS3NotificationsToSQS:
         # set valid but not-existing queue
         config["QueueConfigurations"][0][
             "QueueArn"
-        ] = f"{aws_stack.sqs_queue_arn('my-queue', account_id=account_id)}"
+        ] = f"{arns.sqs_queue_arn('my-queue', account_id=account_id)}"
         with pytest.raises(ClientError) as e:
             s3_client.put_bucket_notification_configuration(
                 Bucket=bucket_name,

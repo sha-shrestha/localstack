@@ -1,7 +1,7 @@
-ARG IMAGE_TYPE=full
+ARG IMAGE_TYPE=community
 
 # java-builder: Stage to build a custom JRE (with jlink)
-FROM python:3.10.7-slim-buster@sha256:7bb70ac0176d6a8bdabba60cd8ededd6494605f225365510f7ee5691a4004463 as java-builder
+FROM python:3.10.8-slim-buster@sha256:6f0a9332035a0268cdca0bfecb509ec17db855e3d079d134373b3bf5bfb9e98f as java-builder
 ARG TARGETARCH
 
 # install OpenJDK 11
@@ -23,6 +23,8 @@ jdk.zipfs,\
 jdk.httpserver,jdk.management,\
 # MQ Broker requires management agent
 jdk.management.agent,\
+# required for Spark/Hadoop
+java.security.jgss,jdk.security.auth,\
 # Elasticsearch 7+ crashes without Thai Segmentation support
 jdk.localedata --include-locales en,th \
     --compress 2 --strip-debug --no-header-files --no-man-pages --output /usr/lib/jvm/java-11 && \
@@ -36,7 +38,7 @@ jdk.localedata --include-locales en,th \
 
 
 # base: Stage which installs necessary runtime dependencies (OS packages, java, maven,...)
-FROM python:3.10.7-slim-buster@sha256:7bb70ac0176d6a8bdabba60cd8ededd6494605f225365510f7ee5691a4004463 as base
+FROM python:3.10.8-slim-buster@sha256:6f0a9332035a0268cdca0bfecb509ec17db855e3d079d134373b3bf5bfb9e98f as base
 ARG TARGETARCH
 
 # Install runtime OS package dependencies
@@ -165,15 +167,98 @@ RUN echo /var/lib/localstack/lib/extensions/python_venv/lib/python3.10/site-pack
     mv localstack-extensions-venv.pth .venv/lib/python*/site-packages/
 
 
+# intermediate step which creates a working localstack image without the entrypoint and the version marker
+FROM base as unmarked
+
+LABEL authors="LocalStack Contributors"
+LABEL maintainer="LocalStack Team (info@localstack.cloud)"
+LABEL description="LocalStack Docker image"
+
+# Copy the build dependencies
+COPY --from=builder /opt/code/localstack/ /opt/code/localstack/
+
+# Copy in postgresql extensions
+COPY --from=builder /usr/share/postgresql/11/extension /usr/share/postgresql/11/extension
+COPY --from=builder /usr/lib/postgresql/11/lib /usr/lib/postgresql/11/lib
+
+RUN if [ -e /usr/bin/aws ]; then mv /usr/bin/aws /usr/bin/aws.bk; fi; ln -s /opt/code/localstack/.venv/bin/aws /usr/bin/aws
+
+# fix some permissions and create local user
+RUN mkdir -p /.npm && \
+    chmod 777 . && \
+    chmod 755 /root && \
+    chmod -R 777 /.npm && \
+    chmod -R 777 /var/lib/localstack && \
+    useradd -ms /bin/bash localstack && \
+    ln -s `pwd` /tmp/localstack_install_dir
+
+# Install the latest version of awslocal globally
+RUN pip3 install --upgrade awscli awscli-local requests
+
+# Add the code in the last step
+ADD localstack/ localstack/
+
+# Install the latest version of localstack-ext and generate the plugin entrypoints.
+# If this is a pre-release build, also include dev releases of these packages.
+ARG LOCALSTACK_PRE_RELEASE=1
+RUN (PIP_ARGS=$([[ "$LOCALSTACK_PRE_RELEASE" == "1" ]] && echo "--pre" || true); \
+      virtualenv .venv && . .venv/bin/activate && \
+      pip3 install --upgrade ${PIP_ARGS} localstack-ext[runtime])
+RUN make entrypoints
+
+# Install packages which should be shipped by default
+RUN source .venv/bin/activate && \
+    python -m localstack.cli.lpm install --parallel 4 \
+      cloudformation-libs \
+      dynamodb-local \
+      iot-rule-engine \
+      kinesis-mock \
+      lambda-java-libs \
+      local-kms \
+      mqtt \
+      postgres \
+      redis \
+      stepfunctions \
+      stepfunctions-local \
+      timescaledb && \
+    rm -rf /tmp/localstack/* && \
+    rm -rf /var/lib/localstack/cache/* && \
+    chmod -R 777 /var/lib/localstack
+
+
+# Add the build date and git hash at last (changes everytime)
+ARG LOCALSTACK_BUILD_DATE
+ARG LOCALSTACK_BUILD_GIT_HASH
+ARG LOCALSTACK_BUILD_VERSION
+ENV LOCALSTACK_BUILD_DATE=${LOCALSTACK_BUILD_DATE}
+ENV LOCALSTACK_BUILD_GIT_HASH=${LOCALSTACK_BUILD_GIT_HASH}
+ENV LOCALSTACK_BUILD_VERSION=${LOCALSTACK_BUILD_VERSION}
+
+# clean up some libs (e.g., Maven should be no longer required after initial installation has completed)
+RUN rm -rf /usr/share/maven
+
+# expose edge service, external service ports, and debugpy
+EXPOSE 4566 4510-4559 5678
+
+HEALTHCHECK --interval=10s --start-period=15s --retries=5 --timeout=5s CMD ./bin/localstack status services --format=json
+
+# default volume directory
+VOLUME /var/lib/localstack
+
+
+# base-community: Stage which will contain the community-version starting from 2.0.0
+FROM unmarked as unmarked-community
+
+# base-pro: Stage which will contain the pro-version starting from 2.0.0
+FROM unmarked as unmarked-pro
 
 # base-light: Stage which does not add additional dependencies (like elasticsearch)
-FROM base as base-light
-RUN touch /usr/lib/localstack/.light-version
-
-
+# FIXME deprecated
+FROM unmarked as unmarked-light
 
 # base-full: Stage which adds additional dependencies to avoid installing them at runtime (f.e. elasticsearch)
-FROM base as base-full
+# FIXME deprecated
+FROM unmarked as unmarked-full
 
 # Install Elasticsearch
 # https://github.com/pires/docker-elasticsearch/issues/56
@@ -206,69 +291,11 @@ RUN TARGETARCH_SYNONYM=$([[ "$TARGETARCH" == "amd64" ]] && echo "x86_64" || echo
         rm -rf $ES_BASE_DIR/modules/ingest-geoip)
 
 
+FROM unmarked-${IMAGE_TYPE}
+ARG IMAGE_TYPE
 
-# light: Stage which produces a final working localstack image (which does not contain some additional infrastructure like eleasticsearch - see "full" stage)
-FROM base-${IMAGE_TYPE}
-
-LABEL authors="LocalStack Contributors"
-LABEL maintainer="LocalStack Team (info@localstack.cloud)"
-LABEL description="LocalStack Docker image"
-
-# Copy the build dependencies
-COPY --from=builder /opt/code/localstack/ /opt/code/localstack/
-
-# Copy in postgresql extensions
-COPY --from=builder /usr/share/postgresql/11/extension /usr/share/postgresql/11/extension
-COPY --from=builder /usr/lib/postgresql/11/lib /usr/lib/postgresql/11/lib
-
-RUN if [ -e /usr/bin/aws ]; then mv /usr/bin/aws /usr/bin/aws.bk; fi; ln -s /opt/code/localstack/.venv/bin/aws /usr/bin/aws
-
-# fix some permissions and create local user
-RUN mkdir -p /.npm && \
-    chmod 777 . && \
-    chmod 755 /root && \
-    chmod -R 777 /.npm && \
-    chmod -R 777 /var/lib/localstack && \
-    useradd -ms /bin/bash localstack && \
-    ln -s `pwd` /tmp/localstack_install_dir
-
-# Install the latest version of awslocal globally
-RUN pip3 install --upgrade awscli awscli-local requests
-
-# Add the code in the last step
-ADD localstack/ localstack/
-
-# Download some more dependencies (make init needs the LocalStack code)
-# FIXME the init python code should be independent (i.e. not depend on the localstack code), idempotent/reproducible,
-#       modify only folders outside of the localstack package folder, and executed in the builder stage.
-RUN make init
-
-# Install the latest version of localstack-ext and generate the plugin entrypoints.
-# If this is a pre-release build, also include dev releases of these packages.
-ARG LOCALSTACK_PRE_RELEASE=1
-RUN (PIP_ARGS=$([[ "$LOCALSTACK_PRE_RELEASE" == "1" ]] && echo "--pre" || true); \
-      virtualenv .venv && . .venv/bin/activate && \
-      pip3 install --upgrade ${PIP_ARGS} localstack-ext[runtime])
-RUN make entrypoints
-
-# Add the build date and git hash at last (changes everytime)
-ARG LOCALSTACK_BUILD_DATE
-ARG LOCALSTACK_BUILD_GIT_HASH
-ARG LOCALSTACK_BUILD_VERSION
-ENV LOCALSTACK_BUILD_DATE=${LOCALSTACK_BUILD_DATE}
-ENV LOCALSTACK_BUILD_GIT_HASH=${LOCALSTACK_BUILD_GIT_HASH}
-ENV LOCALSTACK_BUILD_VERSION=${LOCALSTACK_BUILD_VERSION}
-
-# clean up some libs (e.g., Maven should be no longer required after "make init" has completed)
-RUN rm -rf /usr/share/maven
-
-# expose edge service, external service ports, and debugpy
-EXPOSE 4566 4510-4559 5678
-
-HEALTHCHECK --interval=10s --start-period=15s --retries=5 --timeout=5s CMD ./bin/localstack status services --format=json
-
-# default volume directory
-VOLUME /var/lib/localstack
+# mark the image version
+RUN touch /usr/lib/localstack/.${IMAGE_TYPE}-version
 
 # define command at startup
 ENTRYPOINT ["docker-entrypoint.sh"]

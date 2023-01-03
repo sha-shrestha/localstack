@@ -1,3 +1,4 @@
+import contextlib
 import dataclasses
 import json
 import logging
@@ -16,22 +17,29 @@ from _pytest.config import Config
 from _pytest.nodes import Item
 from botocore.exceptions import ClientError
 from botocore.regions import EndpointResolver
+from moto.core import BackendDict, BaseBackend
 from pytest_httpserver import HTTPServer
 
 from localstack import config
 from localstack.aws.accounts import get_aws_account_id
 from localstack.constants import TEST_AWS_ACCESS_KEY_ID, TEST_AWS_SECRET_ACCESS_KEY
+from localstack.services.stores import (
+    AccountRegionBundle,
+    BaseStore,
+    CrossRegionAttribute,
+    LocalAttribute,
+)
 from localstack.testing.aws.cloudformation_utils import load_template_file, render_template
 from localstack.testing.aws.util import get_lambda_logs
 from localstack.utils import testutil
 from localstack.utils.aws import aws_stack
-from localstack.utils.aws.aws_stack import create_dynamodb_table
 from localstack.utils.aws.client import SigningHttpClient
+from localstack.utils.aws.resources import create_dynamodb_table
 from localstack.utils.collections import ensure_list
 from localstack.utils.functions import run_safe
 from localstack.utils.http import safe_requests as requests
 from localstack.utils.net import wait_for_port_open
-from localstack.utils.strings import short_uid
+from localstack.utils.strings import short_uid, to_str
 from localstack.utils.sync import ShortCircuitWaitException, poll_condition, retry, wait_until
 from localstack.utils.testutil import start_http_server
 
@@ -44,6 +52,7 @@ if TYPE_CHECKING:
     from mypy_boto3_dynamodb import DynamoDBClient, DynamoDBServiceResource
     from mypy_boto3_dynamodbstreams import DynamoDBStreamsClient
     from mypy_boto3_ec2 import EC2Client
+    from mypy_boto3_ecr import ECRClient
     from mypy_boto3_es import ElasticsearchServiceClient
     from mypy_boto3_events import EventBridgeClient
     from mypy_boto3_firehose import FirehoseClient
@@ -57,6 +66,7 @@ if TYPE_CHECKING:
     from mypy_boto3_resource_groups import ResourceGroupsClient
     from mypy_boto3_resourcegroupstaggingapi import ResourceGroupsTaggingAPIClient
     from mypy_boto3_route53 import Route53Client
+    from mypy_boto3_route53resolver import Route53ResolverClient
     from mypy_boto3_s3 import S3Client, S3ServiceResource
     from mypy_boto3_s3control import S3ControlClient
     from mypy_boto3_secretsmanager import SecretsManagerClient
@@ -88,7 +98,7 @@ skip_if_pro_enabled = pytest.mark.skipif(
 )
 
 
-def _client(service, region_name=None, *, additional_config=None):
+def _client(service, region_name=None, aws_access_key_id=None, *, additional_config=None):
     config = botocore.config.Config()
 
     # can't set the timeouts to 0 like in the AWS CLI because the underlying http client requires values > 0
@@ -105,7 +115,9 @@ def _client(service, region_name=None, *, additional_config=None):
     if os.environ.get("TEST_TARGET") == "AWS_CLOUD":
         return boto3.client(service, region_name=region_name, config=config)
 
-    return aws_stack.create_external_boto_client(service, config=config, region_name=region_name)
+    return aws_stack.create_external_boto_client(
+        service, config=config, region_name=region_name, aws_access_key_id=aws_access_key_id
+    )
 
 
 def _resource(service):
@@ -382,8 +394,18 @@ def route53_client() -> "Route53Client":
 
 
 @pytest.fixture(scope="class")
+def route53resolver_client() -> "Route53ResolverClient":
+    return _client("route53resolver")
+
+
+@pytest.fixture(scope="class")
 def transcribe_client() -> "TranscribeClient":
     return _client("transcribe")
+
+
+@pytest.fixture(scope="class")
+def ecr_client() -> "ECRClient":
+    return _client("ecr")
 
 
 @pytest.fixture
@@ -511,6 +533,55 @@ def sqs_create_queue(sqs_client):
 
 
 @pytest.fixture
+def sqs_receive_messages_delete(sqs_client):
+    def factory(
+        queue_url: str,
+        expected_messages: Optional[int] = None,
+        wait_time: Optional[int] = 5,
+    ):
+        response = sqs_client.receive_message(
+            QueueUrl=queue_url,
+            MessageAttributeNames=["All"],
+            VisibilityTimeout=0,
+            WaitTimeSeconds=wait_time,
+        )
+        messages = []
+        for m in response["Messages"]:
+            message = json.loads(to_str(m["Body"]))
+            messages.append(message)
+
+        if expected_messages is not None:
+            assert len(messages) == expected_messages
+
+        for message in response["Messages"]:
+            sqs_client.delete_message(QueueUrl=queue_url, ReceiptHandle=message["ReceiptHandle"])
+
+        return messages
+
+    return factory
+
+
+@pytest.fixture
+def sqs_receive_num_messages(sqs_receive_messages_delete):
+    def factory(queue_url: str, expected_messages: int, max_iterations: int = 3):
+        all_messages = []
+        for _ in range(max_iterations):
+            try:
+                messages = sqs_receive_messages_delete(queue_url, wait_time=5)
+            except KeyError:
+                # there were no messages
+                continue
+            all_messages.extend(messages)
+
+            if len(all_messages) >= expected_messages:
+                return all_messages[:expected_messages]
+
+        raise AssertionError(f"max iterations reached with {len(all_messages)} messages received")
+
+    return factory
+
+
+@pytest.fixture
 def sqs_queue(sqs_create_queue):
     return sqs_create_queue()
 
@@ -562,6 +633,24 @@ def sns_create_topic(sns_client):
             sns_client.delete_topic(TopicArn=topic_arn)
         except Exception as e:
             LOG.debug("error cleaning up topic %s: %s", topic_arn, e)
+
+
+@pytest.fixture
+def sns_wait_for_topic_delete(sns_client):
+    def wait_for_topic_delete(topic_arn: str) -> None:
+        def wait():
+            try:
+                sns_client.get_topic_attributes(TopicArn=topic_arn)
+                return False
+            except Exception as e:
+                if "NotFound" in e.response["Error"]["Code"]:
+                    return True
+
+                raise
+
+        poll_condition(wait, timeout=30)
+
+    return wait_for_topic_delete
 
 
 @pytest.fixture
@@ -734,6 +823,8 @@ def route53_hosted_zone(route53_client):
 
 @pytest.fixture
 def transcribe_create_job(transcribe_client, s3_client, s3_bucket):
+    job_names = []
+
     def _create_job(audio_file: str, params: Optional[dict[str, Any]] = None) -> str:
         s3_key = "test-clip.wav"
 
@@ -755,9 +846,15 @@ def transcribe_create_job(transcribe_client, s3_client, s3_bucket):
 
         transcribe_client.start_transcription_job(**params)
 
+        job_names.append(params["TranscriptionJobName"])
+
         return params["TranscriptionJobName"]
 
     yield _create_job
+
+    for job_name in job_names:
+        with contextlib.suppress(ClientError):
+            transcribe_client.delete_transcription_job(TranscriptionJobName=job_name)
 
 
 @pytest.fixture
@@ -841,7 +938,13 @@ def kms_create_key(create_boto_client):
         try:
             create_boto_client("kms", region).schedule_key_deletion(KeyId=key_id)
         except Exception as e:
-            LOG.debug("error cleaning up KMS key %s: %s", key_id, e)
+            exception_message = str(e)
+            # Some tests schedule their keys for deletion themselves.
+            if (
+                "KMSInvalidStateException" not in exception_message
+                or "is pending deletion" not in exception_message
+            ):
+                LOG.debug("error cleaning up KMS key %s: %s", key_id, e)
 
 
 @pytest.fixture()
@@ -1098,6 +1201,7 @@ def deploy_cfn_template(
         )
         change_set_id = response["Id"]
         stack_id = response["StackId"]
+        state.append({"stack_id": stack_id, "change_set_id": change_set_id})
 
         assert wait_until(is_change_set_created_and_available(change_set_id), _max_wait=60)
         cfn_client.execute_change_set(ChangeSetName=change_set_id)
@@ -1106,8 +1210,6 @@ def deploy_cfn_template(
         outputs = cfn_client.describe_stacks(StackName=stack_id)["Stacks"][0].get("Outputs", [])
 
         mapped_outputs = {o["OutputKey"]: o["OutputValue"] for o in outputs}
-
-        state.append({"stack_id": stack_id, "change_set_id": change_set_id})
 
         def _destroy_stack():
             cfn_client.delete_stack(StackName=stack_id)
@@ -1536,7 +1638,7 @@ def create_secret(secretsmanager_client):
     yield _create_parameter
 
     for item in items:
-        secretsmanager_client.delete_secret(SecretId=item)
+        secretsmanager_client.delete_secret(SecretId=item, ForceDeleteWithoutRecovery=True)
 
 
 # TODO Figure out how to make cert creation tests pass against AWS.
@@ -1695,6 +1797,84 @@ def events_create_rule(events_client):
 
 
 @pytest.fixture
+def ses_configuration_set(ses_client):
+    configuration_set_names = []
+
+    def factory(name: str) -> None:
+        ses_client.create_configuration_set(
+            ConfigurationSet={
+                "Name": name,
+            },
+        )
+        configuration_set_names.append(name)
+
+    yield factory
+
+    for configuration_set_name in configuration_set_names:
+        ses_client.delete_configuration_set(ConfigurationSetName=configuration_set_name)
+
+
+@pytest.fixture
+def ses_configuration_set_sns_event_destination(ses_client):
+    event_destinations = []
+
+    def factory(config_set_name: str, event_destination_name: str, topic_arn: str) -> None:
+        ses_client.create_configuration_set_event_destination(
+            ConfigurationSetName=config_set_name,
+            EventDestination={
+                "Name": event_destination_name,
+                "Enabled": True,
+                "MatchingEventTypes": ["send", "bounce", "delivery", "open", "click"],
+                "SNSDestination": {
+                    "TopicARN": topic_arn,
+                },
+            },
+        )
+        event_destinations.append((config_set_name, event_destination_name))
+
+    yield factory
+
+    for (created_config_set_name, created_event_destination_name) in event_destinations:
+        ses_client.delete_configuration_set_event_destination(
+            ConfigurationSetName=created_config_set_name,
+            EventDestinationName=created_event_destination_name,
+        )
+
+
+@pytest.fixture
+def ses_email_template(ses_client):
+    template_names = []
+
+    def factory(name: str, contents: str, subject: str = f"Email template {short_uid()}"):
+        ses_client.create_template(
+            Template={
+                "TemplateName": name,
+                "SubjectPart": subject,
+                "TextPart": contents,
+            }
+        )
+        template_names.append(name)
+
+    yield factory
+
+    for template_name in template_names:
+        ses_client.delete_template(TemplateName=template_name)
+
+
+@pytest.fixture
+def ses_verify_identity(ses_client):
+    identities = []
+
+    def factory(email_address: str) -> None:
+        ses_client.verify_email_identity(EmailAddress=email_address)
+
+    yield factory
+
+    for identity in identities:
+        ses_client.delete_identity(Identity=identity)
+
+
+@pytest.fixture
 def cleanups(ec2_client):
     cleanup_fns = []
 
@@ -1731,3 +1911,22 @@ def pytest_collection_modifyitems(config: Config, items: list[Item]):
     for item in items:
         if "only_localstack" in item.keywords:
             item.add_marker(only_localstack)
+
+
+@pytest.fixture
+def sample_stores() -> AccountRegionBundle:
+    class SampleStore(BaseStore):
+        CROSS_REGION_ATTR = CrossRegionAttribute(default=list)
+        region_specific_attr = LocalAttribute(default=list)
+
+    return AccountRegionBundle("zzz", SampleStore, validate=False)
+
+
+@pytest.fixture()
+def sample_backend_dict() -> BackendDict:
+    class SampleBackend(BaseBackend):
+        def __init__(self, region_name, account_id):
+            super().__init__(region_name, account_id)
+            self.attributes = {}
+
+    return BackendDict(SampleBackend, "sns")

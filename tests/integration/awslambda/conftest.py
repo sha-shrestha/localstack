@@ -33,7 +33,7 @@ LOG = logging.getLogger(__name__)
 
 RUNTIMES_AGGREGATED = {
     "python": [Runtime.python3_7, Runtime.python3_8, Runtime.python3_9],
-    "nodejs": [Runtime.nodejs12_x, Runtime.nodejs14_x, Runtime.nodejs16_x],
+    "nodejs": [Runtime.nodejs12_x, Runtime.nodejs14_x, Runtime.nodejs16_x, Runtime.nodejs18_x],
     "ruby": [Runtime.ruby2_7],
     "java": [Runtime.java8, Runtime.java8_al2, Runtime.java11],
     "dotnet": [
@@ -243,3 +243,9 @@ def multiruntime_lambda(lambda_client, request, lambda_su_role) -> ParametrizedL
     yield param_lambda
 
     param_lambda.destroy()
+
+
+@pytest.fixture
+def dummylayer():
+    with open(os.path.join(os.path.dirname(__file__), "./layers/testlayer.zip"), "rb") as fd:
+        yield fd.read()

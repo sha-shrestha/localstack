@@ -13,11 +13,12 @@ from localstack.services.awslambda.lambda_api import (
     use_docker,
 )
 from localstack.services.awslambda.lambda_utils import LAMBDA_DEFAULT_HANDLER
-from localstack.services.install import GO_RUNTIME_VERSION, download_and_extract
-from localstack.testing.aws.lambda_utils import is_old_provider
+from localstack.services.awslambda.packages import awslambda_go_runtime_package
+from localstack.testing.aws.lambda_utils import is_new_provider, is_old_provider
 from localstack.testing.pytest.fixtures import skip_if_pro_enabled
 from localstack.utils import testutil
-from localstack.utils.aws import aws_stack
+from localstack.utils.archives import download_and_extract
+from localstack.utils.aws import arns, aws_stack
 from localstack.utils.files import load_file
 from localstack.utils.platform import get_arch, get_os
 from localstack.utils.strings import short_uid, to_bytes, to_str
@@ -27,6 +28,10 @@ from tests.integration.awslambda.test_lambda import (
     TEST_LAMBDA_PYTHON_ECHO,
     TEST_LAMBDA_RUBY,
     read_streams,
+)
+
+pytestmark = pytest.mark.skipif(
+    condition=is_new_provider(), reason="only relevant for old provider"
 )
 
 
@@ -84,7 +89,7 @@ class TestLambdaLegacyProvider:
                 Action=action,
                 StatementId=sid,
                 Principal=principal,
-                SourceArn=aws_stack.s3_bucket_arn("test-bucket"),
+                SourceArn=arns.s3_bucket_arn("test-bucket"),
             )
             assert "Statement" in resp
 
@@ -106,7 +111,7 @@ class TestLambdaLegacyProvider:
             assert lambda_api.func_arn(function_name) == statements[i]["Resource"]
             assert principal == statements[i]["Principal"]["Service"]
             assert (
-                aws_stack.s3_bucket_arn("test-bucket")
+                arns.s3_bucket_arn("test-bucket")
                 == statements[i]["Condition"]["ArnLike"]["AWS:SourceArn"]
             )
             # check statement_ids in reverse order
@@ -138,7 +143,7 @@ class TestLambdaLegacyProvider:
             Action=action,
             StatementId=sid,
             Principal=principal,
-            SourceArn=aws_stack.s3_bucket_arn("test-bucket"),
+            SourceArn=arns.s3_bucket_arn("test-bucket"),
         )
 
         # fetch lambda policy
@@ -150,7 +155,7 @@ class TestLambdaLegacyProvider:
         assert lambda_arn == policy["Statement"][0]["Resource"]
         assert principal == policy["Statement"][0]["Principal"]["Service"]
         assert (
-            aws_stack.s3_bucket_arn("test-bucket")
+            arns.s3_bucket_arn("test-bucket")
             == policy["Statement"][0]["Condition"]["ArnLike"]["AWS:SourceArn"]
         )
 
@@ -272,7 +277,7 @@ class TestGolangRuntimes:
 
         # fetch platform-specific example handler
         url = TEST_GOLANG_LAMBDA_URL_TEMPLATE.format(
-            version=GO_RUNTIME_VERSION,
+            version=awslambda_go_runtime_package.default_version,
             os=get_os(),
             arch=get_arch(),
         )

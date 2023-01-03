@@ -9,10 +9,14 @@ from unittest import mock
 from localstack import config
 from localstack.aws.accounts import get_aws_account_id
 from localstack.services.awslambda import lambda_api, lambda_executors, lambda_utils
-from localstack.services.awslambda.lambda_api import LambdaRegion, get_lambda_policy_name
+from localstack.services.awslambda.lambda_api import get_lambda_policy_name
 from localstack.services.awslambda.lambda_executors import OutputLog
-from localstack.services.awslambda.lambda_utils import API_PATH_ROOT
-from localstack.utils.aws import aws_stack
+from localstack.services.awslambda.lambda_utils import (
+    API_PATH_ROOT,
+    get_awslambda_store,
+    get_awslambda_store_for_arn,
+)
+from localstack.utils.aws import arns, aws_stack
 from localstack.utils.aws.aws_models import LambdaFunction
 from localstack.utils.common import isoformat_milliseconds, mkdir, new_tmp_dir, save_file
 
@@ -68,7 +72,7 @@ class TestLambdaAPI(unittest.TestCase):
             result = json.loads(lambda_api.get_function("myFunction").get_data())
             self.assertEqual(
                 result["Configuration"]["FunctionArn"],
-                aws_stack.lambda_function_arn("myFunction"),
+                arns.lambda_function_arn("myFunction"),
             )
 
     def test_get_function_two_functions_with_similar_names_match_by_name(self):
@@ -78,11 +82,12 @@ class TestLambdaAPI(unittest.TestCase):
             result = json.loads(lambda_api.get_function("myFunction").get_data())
             self.assertEqual(
                 result["Configuration"]["FunctionArn"],
-                aws_stack.lambda_function_arn("myFunction"),
+                arns.lambda_function_arn("myFunction"),
             )
             result = json.loads(lambda_api.get_function("myFunctions").get_data())
             self.assertEqual(
-                result["Configuration"]["FunctionArn"], aws_stack.lambda_function_arn("myFunctions")
+                result["Configuration"]["FunctionArn"],
+                arns.lambda_function_arn("myFunctions"),
             )
 
     def test_get_function_two_functions_with_similar_names_match_by_arn(self):
@@ -90,16 +95,18 @@ class TestLambdaAPI(unittest.TestCase):
             self._create_function("myFunctions")
             self._create_function("myFunction")
             result = json.loads(
-                lambda_api.get_function(aws_stack.lambda_function_arn("myFunction")).get_data()
+                lambda_api.get_function(arns.lambda_function_arn("myFunction")).get_data()
             )
             self.assertEqual(
-                result["Configuration"]["FunctionArn"], aws_stack.lambda_function_arn("myFunction")
+                result["Configuration"]["FunctionArn"],
+                arns.lambda_function_arn("myFunction"),
             )
             result = json.loads(
-                lambda_api.get_function(aws_stack.lambda_function_arn("myFunctions")).get_data()
+                lambda_api.get_function(arns.lambda_function_arn("myFunctions")).get_data()
             )
             self.assertEqual(
-                result["Configuration"]["FunctionArn"], aws_stack.lambda_function_arn("myFunctions")
+                result["Configuration"]["FunctionArn"],
+                arns.lambda_function_arn("myFunctions"),
             )
 
     def test_get_function_two_functions_with_similar_names_match_by_partial_arn(self):
@@ -112,7 +119,8 @@ class TestLambdaAPI(unittest.TestCase):
                 ).get_data()
             )
             self.assertEqual(
-                result["Configuration"]["FunctionArn"], aws_stack.lambda_function_arn("myFunction")
+                result["Configuration"]["FunctionArn"],
+                arns.lambda_function_arn("myFunction"),
             )
             result = json.loads(
                 lambda_api.get_function(
@@ -120,18 +128,19 @@ class TestLambdaAPI(unittest.TestCase):
                 ).get_data()
             )
             self.assertEqual(
-                result["Configuration"]["FunctionArn"], aws_stack.lambda_function_arn("myFunctions")
+                result["Configuration"]["FunctionArn"],
+                arns.lambda_function_arn("myFunctions"),
             )
 
     def test_get_event_source_mapping(self):
-        region = lambda_api.LambdaRegion.get()
+        region = get_awslambda_store()
         with self.app.test_request_context():
             region.event_source_mappings.append({"UUID": self.TEST_UUID})
             result = lambda_api.get_event_source_mapping(self.TEST_UUID)
             self.assertEqual(self.TEST_UUID, json.loads(result.get_data()).get("UUID"))
 
     def test_get_event_sources(self):
-        region = lambda_api.LambdaRegion.get()
+        region = get_awslambda_store()
         with self.app.test_request_context():
             region.event_source_mappings.append(
                 {"UUID": self.TEST_UUID, "EventSourceArn": "the_arn"}
@@ -147,7 +156,7 @@ class TestLambdaAPI(unittest.TestCase):
             self.assertEqual(0, len(result))
 
     def test_get_event_sources_with_paths(self):
-        region = lambda_api.LambdaRegion.get()
+        region = get_awslambda_store()
         with self.app.test_request_context():
             region.event_source_mappings.append(
                 {"UUID": self.TEST_UUID, "EventSourceArn": "the_arn/path/subpath"}
@@ -160,7 +169,7 @@ class TestLambdaAPI(unittest.TestCase):
             self.assertEqual(1, len(result))
 
     def test_delete_event_source_mapping(self):
-        region = lambda_api.LambdaRegion.get()
+        region = get_awslambda_store()
         with self.app.test_request_context():
             region.event_source_mappings.append({"UUID": self.TEST_UUID})
             result = lambda_api.delete_event_source_mapping(self.TEST_UUID)
@@ -762,7 +771,7 @@ class TestLambdaAPI(unittest.TestCase):
 
     def test_get_container_name(self):
         executor = lambda_executors.EXECUTOR_CONTAINERS_REUSE
-        name = executor.get_container_name(aws_stack.lambda_function_arn("my_function_name"))
+        name = executor.get_container_name(arns.lambda_function_arn("my_function_name"))
         self.assertIn(
             f"_lambda_arn_aws_lambda_{aws_stack.get_region()}_{get_aws_account_id()}_function_my_function_name",
             name,
@@ -1008,7 +1017,7 @@ class TestLambdaAPI(unittest.TestCase):
     def _create_function(self, function_name, tags=None):
         if tags is None:
             tags = {}
-        region = lambda_api.LambdaRegion.get()
+        region = get_awslambda_store()
         arn = lambda_api.func_arn(function_name)
         region.lambdas[arn] = LambdaFunction(arn)
         region.lambdas[arn].versions = {
@@ -1031,7 +1040,7 @@ class TestLambdaAPI(unittest.TestCase):
     def _update_function_code(self, function_name, tags=None):
         if tags is None:
             tags = {}
-        region = lambda_api.LambdaRegion.get()
+        region = get_awslambda_store()
         arn = lambda_api.func_arn(function_name)
         region.lambdas[arn].versions.update(
             {
@@ -1133,14 +1142,14 @@ class TestLambdaEventInvokeConfig(unittest.TestCase):
         self.assertEqual(self.DL_QUEUE, response["DestinationConfig"]["OnFailure"]["Destination"])
 
 
-class TestLambdaRegionBackend:
-    def test_get_region_backend_for_arn(self):
+class TestLambdaStore:
+    def test_get_awslambda_store_for_arn(self):
         default_region = aws_stack.get_region()
 
         def _lookup(resource_id, region):
-            backend = LambdaRegion.get_for_arn(resource_id)
-            assert backend
-            assert backend.name == region
+            store = get_awslambda_store_for_arn(resource_id)
+            assert store
+            assert store._region_name == region
 
         _lookup("my-func", default_region)
         _lookup("my-layer", default_region)
@@ -1149,9 +1158,9 @@ class TestLambdaRegionBackend:
 
         for region in ["us-east-1", "us-east-1", "eu-central-1"]:
             # check lookup for function ARNs
-            _lookup(aws_stack.lambda_function_arn("myfunc", region_name=region), region)
+            _lookup(arns.lambda_function_arn("myfunc", region_name=region), region)
             # check lookup for layer ARNs
-            _lookup(aws_stack.lambda_layer_arn("mylayer", region_name=region), region)
+            _lookup(arns.lambda_layer_arn("mylayer", region_name=region), region)
 
 
 class TestLambdaUtils:

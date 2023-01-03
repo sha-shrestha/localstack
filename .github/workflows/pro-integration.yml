@@ -42,7 +42,7 @@ concurrency:
 jobs:
   run-integration-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 100
+    timeout-minutes: 110
     defaults:
       run:
         working-directory: localstack-ext
@@ -74,8 +74,8 @@ jobs:
                   if (error.status == 404) {
                     return false
                   } else {
-                    // another (unexpected) error ocurred, raise the error
-                    throw new Error(`Fetching companion refs failed: ${JSON.stringify(error)}`)
+                    // another (unexpected) error occurred, raise the error
+                    throw new Error(`Fetching companion refs failed: ${error}`)
                   }
               }
             }
@@ -156,7 +156,6 @@ jobs:
         working-directory: localstack
         run: |
           make install
-          make init
       - name: Link community LocalStack into Pro venv
         run: |
           source .venv/bin/activate

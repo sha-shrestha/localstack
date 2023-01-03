@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import copy
 import functools
-import inspect
 import json
 import logging
 import os
@@ -11,9 +9,8 @@ import socket
 import ssl
 import threading
 from asyncio.selector_events import BaseSelectorEventLoop
-from collections import defaultdict
-from typing import DefaultDict, Dict, List, Match, Optional, Type, TypeVar, Union
-from urllib.parse import parse_qs, unquote, urlencode, urlparse
+from typing import Dict, List, Optional, Union
+from urllib.parse import urlparse
 
 import requests
 from flask_cors import CORS
@@ -28,27 +25,18 @@ from requests.models import Request, Response
 from werkzeug.exceptions import HTTPException
 
 from localstack import config
-from localstack.aws.accounts import get_aws_account_id
 from localstack.config import (
     EXTRA_CORS_ALLOWED_HEADERS,
     EXTRA_CORS_ALLOWED_ORIGINS,
     EXTRA_CORS_EXPOSE_HEADERS,
-    MULTI_ACCOUNTS,
 )
-from localstack.constants import (
-    APPLICATION_JSON,
-    AWS_REGION_US_EAST_1,
-    BIND_HOST,
-    HEADER_LOCALSTACK_REQUEST_URL,
-)
+from localstack.constants import APPLICATION_JSON, BIND_HOST, HEADER_LOCALSTACK_REQUEST_URL
 from localstack.http.request import get_full_raw_path
 from localstack.services.messages import Headers, MessagePayload
 from localstack.services.messages import Request as RoutingRequest
 from localstack.services.messages import Response as RoutingResponse
 from localstack.utils.asyncio import run_sync
-from localstack.utils.aws import aws_stack
-from localstack.utils.aws.aws_responses import LambdaResponse, calculate_crc32
-from localstack.utils.aws.aws_stack import is_internal_call_context
+from localstack.utils.aws.aws_responses import LambdaResponse
 from localstack.utils.aws.request_context import RequestContextManager, get_proxy_request_for_thread
 from localstack.utils.crypto import generate_ssl_cert
 from localstack.utils.functions import empty_context_manager
@@ -56,7 +44,6 @@ from localstack.utils.json import json_safe
 from localstack.utils.net import wait_for_port_open
 from localstack.utils.server import http2_server
 from localstack.utils.serving import Server
-from localstack.utils.strings import to_bytes, to_str
 from localstack.utils.threads import start_thread
 
 # set up logger
@@ -203,272 +190,6 @@ class MessageModifyingProxyListener(ProxyListener):
         """Return a RoutingResponse with modified response data, or None to forward the response
         unmodified"""
         return None
-
-
-class ArnPartitionRewriteListener(MessageModifyingProxyListener):
-    """
-    Intercepts requests and responses and tries to adjust the partitions in ARNs within the
-    intercepted requests.
-    For incoming requests, the default partition is set ("aws").
-    For outgoing responses, the partition is adjusted based on the region in the ARN, or by the
-    default region
-    if the ARN does not contain a region.
-    This listener is used to support other partitions than the default "aws" partition (f.e.
-    aws-us-gov) without
-    rewriting all the cases where the ARN is parsed or constructed within LocalStack or moto.
-    In other words, this listener makes sure that internally the ARNs are always in the partition
-    "aws", while the
-    client gets ARNs with the proper partition.
-    """
-
-    # Partition which should be statically set for incoming requests
-    DEFAULT_INBOUND_PARTITION = "aws"
-
-    class InvalidRegionException(Exception):
-        """An exception indicating that a region could not be matched to a partition."""
-
-    arn_regex = re.compile(
-        r"arn:"  # Prefix
-        r"(?P<Partition>(aws|aws-cn|aws-iso|aws-iso-b|aws-us-gov)*):"  # Partition
-        r"(?P<Service>[\w-]*):"  # Service (lambda, s3, ecs,...)
-        r"(?P<Region>[\w-]*):"  # Region (us-east-1, us-gov-west-1,...)
-        r"(?P<AccountID>[\w-]*):"  # AccountID
-        r"(?P<ResourcePath>"  # Combine the resource type and id to the ResourcePath
-        r"((?P<ResourceType>[\w-]*)[:/])?"  # ResourceType (optional, f.e. S3 bucket name)
-        r"(?P<ResourceID>[\w\-/*]*)"  # Resource ID (f.e. file name in S3)
-        r")"
-    )
-
-    def forward_request(
-        self, method: str, path: str, data: MessagePayload, headers: Headers
-    ) -> Optional[RoutingRequest]:
-        return RoutingRequest(
-            method=method,
-            path=self._adjust_partition_in_path(path, self.DEFAULT_INBOUND_PARTITION),
-            data=self._adjust_partition(data, self.DEFAULT_INBOUND_PARTITION),
-            headers=self._adjust_partition(headers, self.DEFAULT_INBOUND_PARTITION),
-        )
-
-    def return_response(
-        self,
-        method: str,
-        path: str,
-        data: MessagePayload,
-        headers: Headers,
-        response: Response,
-    ) -> Optional[RoutingResponse]:
-        # Only handle responses for calls from external clients
-        if is_internal_call_context(headers):
-            return None
-        response = RoutingResponse(
-            status_code=response.status_code,
-            content=self._adjust_partition(response.content),
-            headers=self._adjust_partition(response.headers),
-        )
-        self._post_process_response_headers(response)
-        return response
-
-    def _adjust_partition_in_path(self, path: str, static_partition: str = None):
-        """Adjusts the (still url encoded) URL path"""
-        parsed_url = urlparse(path)
-        # Make sure to keep blank values, otherwise we drop query params which do not have a
-        # value (f.e. "/?policy")
-        decoded_query = parse_qs(qs=parsed_url.query, keep_blank_values=True)
-        adjusted_path = self._adjust_partition(parsed_url.path, static_partition)
-        adjusted_query = self._adjust_partition(decoded_query, static_partition)
-        encoded_query = urlencode(adjusted_query, doseq=True)
-
-        # Make sure to avoid empty equals signs (in between and in the end)
-        encoded_query = encoded_query.replace("=&", "&")
-        encoded_query = re.sub(r"=$", "", encoded_query)
-
-        return f"{adjusted_path}{('?' + encoded_query) if encoded_query else ''}"
-
-    def _adjust_partition(self, source, static_partition: str = None):
-        # Call this function recursively if we get a dictionary or a list
-        if isinstance(source, dict):
-            result = {}
-            for k, v in source.items():
-                result[k] = self._adjust_partition(v, static_partition)
-            return result
-        if isinstance(source, list):
-            result = []
-            for v in source:
-                result.append(self._adjust_partition(v, static_partition))
-            return result
-        elif isinstance(source, bytes):
-            try:
-                decoded = unquote(to_str(source))
-                adjusted = self._adjust_partition(decoded, static_partition)
-                return to_bytes(adjusted)
-            except UnicodeDecodeError:
-                # If the body can't be decoded to a string, we return the initial source
-                return source
-        elif not isinstance(source, str):
-            # Ignore any other types
-            return source
-        return self.arn_regex.sub(lambda m: self._adjust_match(m, static_partition), source)
-
-    def _adjust_match(self, match: Match, static_partition: str = None):
-        region = match.group("Region")
-        partition = self._partition_lookup(region) if static_partition is None else static_partition
-        service = match.group("Service")
-        account_id = match.group("AccountID")
-        resource_path = match.group("ResourcePath")
-        return f"arn:{partition}:{service}:{region}:{account_id}:{resource_path}"
-
-    def _partition_lookup(self, region: str):
-        try:
-            partition = self._get_partition_for_region(region)
-        except ArnPartitionRewriteListener.InvalidRegionException:
-            try:
-                # If the region is not properly set (f.e. because it is set to a wildcard),
-                # the partition is determined based on the default region.
-                partition = self._get_partition_for_region(config.DEFAULT_REGION)
-            except self.InvalidRegionException:
-                # If it also fails with the DEFAULT_REGION, we use us-east-1 as a fallback
-                partition = self._get_partition_for_region(AWS_REGION_US_EAST_1)
-        return partition
-
-    @staticmethod
-    def _get_partition_for_region(region: Optional[str]) -> str:
-        # Region-Partition matching is based on the "regionRegex" definitions in the endpoints.json
-        # in the botocore package.
-        if region and region.startswith("us-gov-"):
-            return "aws-us-gov"
-        elif region and region.startswith("us-iso-"):
-            return "aws-iso"
-        elif region and region.startswith("us-isob-"):
-            return "aws-iso-b"
-        elif region and region.startswith("cn-"):
-            return "aws-cn"
-        elif region and re.match(r"^(us|eu|ap|sa|ca|me|af)-\w+-\d+$", region):
-            return "aws"
-        else:
-            raise ArnPartitionRewriteListener.InvalidRegionException(
-                f"Region ({region}) could not be matched to a partition."
-            )
-
-    @staticmethod
-    def _post_process_response_headers(response: RoutingResponse) -> None:
-        """Adjust potential content lengths and checksums after modifying the response."""
-        if response.headers and response.content:
-            if "Content-Length" in response.headers:
-                response.headers["Content-Length"] = str(len(to_bytes(response.content)))
-            if "x-amz-crc32" in response.headers:
-                response.headers["x-amz-crc32"] = calculate_crc32(response.content)
-
-
-# -------------------
-# BASE BACKEND UTILS
-# -------------------
-
-T = TypeVar("T", bound="RegionBackend")
-
-
-class RegionBackend:
-    """Base class for provider backends. RegionBackend lookup methods are not thread safe.
-
-    RegionBackend transparently performs namespacing per AWS account IDs.
-
-    Usage
-    =====
-    RegionBackend must be subclassed in the provider where it is to be used.
-    Cross-region data must be defined as class attributes, and region-specific data as instance attributes.
-
-        class FooBackend(RegionBackend):
-            USERS: List[str] = []  # `USERS` is common across regions and defined+initialised as class attribute
-            order: Dict[str, str]  # `order` is specific to a region and declared as instance attribute
-
-            def __init__(self):
-                self.order = {}  # `order` must be initialised
-
-    Limitations
-    ===========
-    - Do not add new staticmethods/classmethods to subclasses. This causes issues with deepcopy
-    """
-
-    # Map of AWS account IDs to copies of this class
-    _ACCOUNTS_CLS: Dict[str, Type[T]]
-
-    # Map of AWS account IDs to (Map of region names to backend instances)
-    _ACCOUNT_BACKENDS: DefaultDict[str, Dict[str, T]]
-
-    # Used when multi-accounts is disabled
-    REGIONS: Dict[str, T]
-
-    name: str  # name of the region for the backend instance
-    account_id: str  # AWS account ID of the backend instance
-
-    @classmethod
-    def get(cls: Type[T], region: str = None, account_id: str = None) -> T:
-        cls.initialise()
-
-        region = region or cls.get_current_request_region()
-        account_id = account_id or cls.get_current_request_account_id()
-
-        # Class attributes in RegionBackend need two types of data isolation:
-        # - Class attributes like `_ACCOUNT_BACKENDS` must refer to the same mutable object across ALL instances.
-        # - Class attributes defined in subclasses represent data common across regions but same account IDs
-        # To enable this, we keep copies of this class in `_ACCOUNT_CLS` by account IDs and instantiate that
-        # copy of the class for different regions and same account ID
-        if MULTI_ACCOUNTS and account_id not in cls._ACCOUNTS_CLS:
-            # @classmethod descriptors will be part of a cls.__dict__, but they cannot be pickled by deepcopy
-            data = {k: v for k, v in cls.__dict__.items() if not inspect.ismethoddescriptor(v)}
-            cls_dict = copy.deepcopy(data)
-            cls_dict["_ACCOUNTS_CLS"] = cls._ACCOUNTS_CLS
-            cls_dict["_ACCOUNT_BACKENDS"] = cls._ACCOUNT_BACKENDS
-
-            cls._ACCOUNTS_CLS[account_id] = type(cls.__name__, cls.__bases__, cls_dict)
-
-        regions = cls.regions()
-        backend = regions.get(region)
-
-        if not backend:
-            if MULTI_ACCOUNTS:
-                backend = cls._ACCOUNTS_CLS[account_id]()
-            else:
-                backend = cls()
-
-            backend.name = region
-            backend.account_id = account_id
-            regions[region] = backend
-
-        return regions[region]
-
-    @classmethod
-    def initialise(cls):
-        if not hasattr(cls, "_ACCOUNT_BACKENDS"):
-            cls._ACCOUNT_BACKENDS = defaultdict(lambda: dict())
-
-        if not hasattr(cls, "_ACCOUNTS_CLS"):
-            cls._ACCOUNTS_CLS = dict()
-
-        if not hasattr(cls, "REGIONS"):
-            cls.REGIONS = dict()
-
-    @classmethod
-    def regions(cls: Type[T]) -> Dict[str, T]:
-        """Return a map of all regions and backend instances."""
-        cls.initialise()
-        account_id = cls.get_current_request_account_id()
-        return cls._ACCOUNT_BACKENDS[account_id]
-
-    @classmethod
-    def get_current_request_region(cls) -> str:
-        return aws_stack.get_region()
-
-    @classmethod
-    def get_current_request_account_id(cls) -> str:
-        return get_aws_account_id()
-
-    @classmethod
-    def reset(cls):
-        """Reset the (in-memory) state of this service region backend."""
-        cls.initialise()
-        cls.REGIONS = {}
-        account_id = cls.get_current_request_account_id()
-        cls._ACCOUNT_BACKENDS[account_id] = {}
 
 
 # ---------------------
@@ -1023,7 +744,7 @@ if hasattr(BaseSelectorEventLoop, "_accept_connection2") and not hasattr(
 
 
 def get_cert_pem_file_path():
-    return os.path.join(config.dirs.cache, SERVER_CERT_PEM_FILE)
+    return config.CUSTOM_SSL_CERT_PATH or os.path.join(config.dirs.cache, SERVER_CERT_PEM_FILE)
 
 
 def start_proxy_server(
@@ -1126,5 +847,5 @@ def serve_flask_app(app, port, host=None, cors=True, asynchronous=False):
         return app
 
     if asynchronous:
-        return start_thread(_run)
+        return start_thread(_run, name="flaskapp")
     return _run()

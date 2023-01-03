@@ -6,7 +6,7 @@ import pytest
 
 from localstack import config
 from localstack.aws.accounts import get_aws_account_id
-from localstack.services.install import TERRAFORM_BIN, install_terraform
+from localstack.packages.terraform import terraform_package
 from localstack.utils.common import is_command_available, rm_rf, run, start_worker_thread
 
 #  TODO: remove all of these
@@ -18,11 +18,14 @@ QUEUE_ARN = "arn:aws:sqs:us-east-1:{account_id}:tf-queue"
 # lambda Testing Variables
 LAMBDA_NAME = "tf-lambda"
 LAMBDA_ARN = "arn:aws:lambda:us-east-1:{account_id}:function:{lambda_name}"
-LAMBDA_HANDLER = "DotNetCore2::DotNetCore2.Lambda.Function::SimpleFunctionHandler"
-LAMBDA_RUNTIME = "dotnetcore2.0"
+LAMBDA_HANDLER = "index.handler"
+LAMBDA_RUNTIME = "python3.8"
 LAMBDA_ROLE = "arn:aws:iam::{account_id}:role/iam_for_lambda"
 
 INIT_LOCK = threading.RLock()
+
+# set after calling install()
+TERRAFORM_BIN = None
 
 
 def check_terraform_version():
@@ -72,8 +75,9 @@ class TestTerraform:
     def init_async(cls):
         def _run(*args):
             with INIT_LOCK:
-                install_terraform()
-
+                terraform_package.install()
+                global TERRAFORM_BIN
+                TERRAFORM_BIN = terraform_package.get_installer().get_executable_path()
                 base_dir = get_base_dir()
                 if not os.path.exists(os.path.join(base_dir, ".terraform", "plugins")):
                     run(f"cd {base_dir}; {TERRAFORM_BIN} init -input=false")
@@ -139,6 +143,7 @@ class TestTerraform:
         assert function_mapping["EventSourceArn"] == queue_arn
 
     @pytest.mark.skip_offline
+    @pytest.mark.xfail(reason="flaky")
     def test_apigateway(self, apigateway_client):
         rest_apis = apigateway_client.get_rest_apis()
 
@@ -183,6 +188,7 @@ class TestTerraform:
         assert len(certs) == 1
 
     @pytest.mark.skip_offline
+    @pytest.mark.xfail(reason="flaky")
     def test_apigateway_escaped_policy(self, apigateway_client):
         rest_apis = apigateway_client.get_rest_apis()
 

@@ -70,6 +70,7 @@ MonitoringTimeInMinutes = int
 NextToken = str
 NoEcho = bool
 NotificationARN = str
+OperationResultFilterValues = str
 OptionalSecureUrl = str
 OrganizationalUnitId = str
 OutputKey = str
@@ -270,6 +271,7 @@ class HandlerErrorCode(str):
     HandlerInternalFailure = "HandlerInternalFailure"
     NonCompliant = "NonCompliant"
     Unknown = "Unknown"
+    UnsupportedTarget = "UnsupportedTarget"
 
 
 class HookFailureMode(str):
@@ -302,6 +304,10 @@ class OnFailure(str):
     DO_NOTHING = "DO_NOTHING"
     ROLLBACK = "ROLLBACK"
     DELETE = "DELETE"
+
+
+class OperationResultFilterName(str):
+    OPERATION_RESULT_STATUS = "OPERATION_RESULT_STATUS"
 
 
 class OperationStatus(str):
@@ -419,6 +425,7 @@ class StackInstanceDetailedStatus(str):
 
 class StackInstanceFilterName(str):
     DETAILED_STATUS = "DETAILED_STATUS"
+    LAST_OPERATION_ID = "LAST_OPERATION_ID"
 
 
 class StackInstanceStatus(str):
@@ -1216,6 +1223,7 @@ class StackInstance(TypedDict, total=False):
     OrganizationalUnitId: Optional[OrganizationalUnitId]
     DriftStatus: Optional[StackDriftStatus]
     LastDriftCheckTimestamp: Optional[Timestamp]
+    LastOperationId: Optional[ClientRequestToken]
 
 
 class DescribeStackInstanceOutput(TypedDict, total=False):
@@ -1339,6 +1347,10 @@ class DescribeStackSetOperationInput(ServiceRequest):
     CallAs: Optional[CallAs]
 
 
+class StackSetOperationStatusDetails(TypedDict, total=False):
+    FailedStackInstancesCount: Optional[FailedStackInstancesCount]
+
+
 class StackSetDriftDetectionDetails(TypedDict, total=False):
     DriftStatus: Optional[StackSetDriftStatus]
     DriftDetectionStatus: Optional[StackSetDriftDetectionStatus]
@@ -1364,6 +1376,7 @@ class StackSetOperation(TypedDict, total=False):
     DeploymentTargets: Optional[DeploymentTargets]
     StackSetDriftDetectionDetails: Optional[StackSetDriftDetectionDetails]
     StatusReason: Optional[StackSetOperationStatusReason]
+    StatusDetails: Optional[StackSetOperationStatusDetails]
 
 
 class DescribeStackSetOperationOutput(TypedDict, total=False):
@@ -1721,6 +1734,7 @@ class StackInstanceSummary(TypedDict, total=False):
     OrganizationalUnitId: Optional[OrganizationalUnitId]
     DriftStatus: Optional[StackDriftStatus]
     LastDriftCheckTimestamp: Optional[Timestamp]
+    LastOperationId: Optional[ClientRequestToken]
 
 
 StackInstanceSummaries = List[StackInstanceSummary]
@@ -1760,12 +1774,21 @@ class ListStackResourcesOutput(TypedDict, total=False):
     NextToken: Optional[NextToken]
 
 
+class OperationResultFilter(TypedDict, total=False):
+    Name: Optional[OperationResultFilterName]
+    Values: Optional[OperationResultFilterValues]
+
+
+OperationResultFilters = List[OperationResultFilter]
+
+
 class ListStackSetOperationResultsInput(ServiceRequest):
     StackSetName: StackSetName
     OperationId: ClientRequestToken
     NextToken: Optional[NextToken]
     MaxResults: Optional[MaxResults]
     CallAs: Optional[CallAs]
+    Filters: Optional[OperationResultFilters]
 
 
 class StackSetOperationResultSummary(TypedDict, total=False):
@@ -1799,6 +1822,8 @@ class StackSetOperationSummary(TypedDict, total=False):
     CreationTimestamp: Optional[Timestamp]
     EndTimestamp: Optional[Timestamp]
     StatusReason: Optional[StackSetOperationStatusReason]
+    StatusDetails: Optional[StackSetOperationStatusDetails]
+    OperationPreferences: Optional[StackSetOperationPreferences]
 
 
 StackSetOperationSummaries = List[StackSetOperationSummary]
@@ -2600,6 +2625,7 @@ class CloudformationApi:
         next_token: NextToken = None,
         max_results: MaxResults = None,
         call_as: CallAs = None,
+        filters: OperationResultFilters = None,
     ) -> ListStackSetOperationResultsOutput:
         raise NotImplementedError
 

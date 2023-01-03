@@ -129,6 +129,7 @@ class CloudWatchRegion(str):
     us_west_2 = "us-west-2"
     ca_central_1 = "ca-central-1"
     eu_central_1 = "eu-central-1"
+    eu_central_2 = "eu-central-2"
     eu_west_1 = "eu-west-1"
     eu_west_2 = "eu-west-2"
     eu_west_3 = "eu-west-3"
@@ -136,6 +137,7 @@ class CloudWatchRegion(str):
     me_south_1 = "me-south-1"
     me_central_1 = "me-central-1"
     ap_south_1 = "ap-south-1"
+    ap_south_2 = "ap-south-2"
     ap_southeast_1 = "ap-southeast-1"
     ap_southeast_2 = "ap-southeast-2"
     ap_southeast_3 = "ap-southeast-3"
@@ -148,6 +150,7 @@ class CloudWatchRegion(str):
     cn_north_1 = "cn-north-1"
     af_south_1 = "af-south-1"
     eu_south_1 = "eu-south-1"
+    eu_south_2 = "eu-south-2"
     us_gov_west_1 = "us-gov-west-1"
     us_gov_east_1 = "us-gov-east-1"
     us_iso_east_1 = "us-iso-east-1"
@@ -233,6 +236,7 @@ class ResourceRecordSetRegion(str):
     eu_west_2 = "eu-west-2"
     eu_west_3 = "eu-west-3"
     eu_central_1 = "eu-central-1"
+    eu_central_2 = "eu-central-2"
     ap_southeast_1 = "ap-southeast-1"
     ap_southeast_2 = "ap-southeast-2"
     ap_southeast_3 = "ap-southeast-3"
@@ -245,9 +249,12 @@ class ResourceRecordSetRegion(str):
     cn_northwest_1 = "cn-northwest-1"
     ap_east_1 = "ap-east-1"
     me_south_1 = "me-south-1"
+    me_central_1 = "me-central-1"
     ap_south_1 = "ap-south-1"
+    ap_south_2 = "ap-south-2"
     af_south_1 = "af-south-1"
     eu_south_1 = "eu-south-1"
+    eu_south_2 = "eu-south-2"
 
 
 class ReusableDelegationSetLimitType(str):
@@ -276,6 +283,7 @@ class VPCRegion(str):
     eu_west_2 = "eu-west-2"
     eu_west_3 = "eu-west-3"
     eu_central_1 = "eu-central-1"
+    eu_central_2 = "eu-central-2"
     ap_east_1 = "ap-east-1"
     me_south_1 = "me-south-1"
     us_gov_west_1 = "us-gov-west-1"
@@ -288,6 +296,7 @@ class VPCRegion(str):
     ap_southeast_2 = "ap-southeast-2"
     ap_southeast_3 = "ap-southeast-3"
     ap_south_1 = "ap-south-1"
+    ap_south_2 = "ap-south-2"
     ap_northeast_1 = "ap-northeast-1"
     ap_northeast_2 = "ap-northeast-2"
     ap_northeast_3 = "ap-northeast-3"
@@ -297,6 +306,7 @@ class VPCRegion(str):
     cn_north_1 = "cn-north-1"
     af_south_1 = "af-south-1"
     eu_south_1 = "eu-south-1"
+    eu_south_2 = "eu-south-2"
 
 
 class CidrBlockInUseException(ServiceException):

@@ -9,14 +9,17 @@ from typing import TYPE_CHECKING, Dict, Literal, Optional
 from localstack import config
 from localstack.services.awslambda.invocation.executor_endpoint import ServiceEndpoint
 from localstack.services.awslambda.invocation.lambda_models import Credentials, FunctionVersion
-from localstack.services.awslambda.invocation.runtime_executor import RuntimeExecutor
+from localstack.services.awslambda.invocation.runtime_executor import (
+    RuntimeExecutor,
+    get_runtime_executor,
+)
 from localstack.utils.aws import aws_stack
 from localstack.utils.strings import to_str
 
 if TYPE_CHECKING:
     from localstack.services.awslambda.invocation.version_manager import QueuedInvocation
 
-STARTUP_TIMEOUT_SEC = 10.0
+STARTUP_TIMEOUT_SEC = config.LAMBDA_RUNTIME_ENVIRONMENT_TIMEOUT
 HEX_CHARS = [str(num) for num in range(10)] + ["a", "b", "c", "d", "e", "f"]
 
 LOG = logging.getLogger(__name__)
@@ -62,7 +65,7 @@ class RuntimeEnvironment:
         self.status_lock = RLock()
         self.function_version = function_version
         self.initialization_type = initialization_type
-        self.runtime_executor = RuntimeExecutor(
+        self.runtime_executor = get_runtime_executor()(
             self.id, function_version, service_endpoint=service_endpoint
         )
         self.last_returned = datetime.min
@@ -83,7 +86,7 @@ class RuntimeEnvironment:
         env_vars = {
             # Runtime API specifics
             "LOCALSTACK_RUNTIME_ID": self.id,
-            "LOCALSTACK_RUNTIME_ENDPOINT": f"http://{self.runtime_executor.get_endpoint_from_executor()}:{self.runtime_executor.executor_endpoint.port}",
+            "LOCALSTACK_RUNTIME_ENDPOINT": self.runtime_executor.get_runtime_endpoint(),
             # General Lambda Environment Variables
             "AWS_LAMBDA_LOG_GROUP_NAME": self.get_log_group_name(),
             "AWS_LAMBDA_LOG_STREAM_NAME": self.get_log_stream_name(),
@@ -124,7 +127,11 @@ class RuntimeEnvironment:
             if self.status != RuntimeStatus.INACTIVE:
                 raise InvalidStatusException("Runtime Handler can only be started when inactive")
             self.status = RuntimeStatus.STARTING
-            self.runtime_executor.start(self.get_environment_variables())
+            try:
+                self.runtime_executor.start(self.get_environment_variables())
+            except Exception:
+                self.errored()
+                raise
             self.startup_timer = Timer(STARTUP_TIMEOUT_SEC, self.timed_out)
             self.startup_timer.start()
 
@@ -158,7 +165,7 @@ class RuntimeEnvironment:
             self.status = RuntimeStatus.READY
 
     def timed_out(self) -> None:
-        LOG.debug(
+        LOG.warning(
             "Executor %s for function %s timed out during startup",
             self.id,
             self.function_version.qualified_arn,

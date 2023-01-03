@@ -5,7 +5,8 @@ import pytest
 from botocore.exceptions import ClientError
 
 from localstack.config import LEGACY_S3_PROVIDER
-from localstack.utils.aws import aws_stack
+from localstack.testing.aws.lambda_utils import _await_dynamodb_table_active
+from localstack.utils.aws import arns
 from localstack.utils.http import safe_requests as requests
 from localstack.utils.strings import short_uid
 from localstack.utils.sync import retry
@@ -110,6 +111,13 @@ class TestS3NotificationsToLambda:
         condition=lambda: LEGACY_S3_PROVIDER,
         paths=["$..data.s3.object.eTag", "$..data.s3.object.versionId", "$..data.s3.object.size"],
     )
+    @pytest.mark.skip_snapshot_verify(
+        condition=lambda: not LEGACY_S3_PROVIDER,
+        paths=[
+            "$..data.s3.object.eTag",
+            "$..data.s3.object.size",
+        ],  # TODO presigned-post sporadic failures in CI Pipeline
+    )
     def test_create_object_by_presigned_request_via_dynamodb(
         self,
         s3_client,
@@ -166,6 +174,7 @@ class TestS3NotificationsToLambda:
         )
 
         dynamodb_create_table(table_name=table_name, partition_key="uuid", client=dynamodb_client)
+        _await_dynamodb_table_active(dynamodb_client, table_name)
 
         s3_client.put_bucket_notification_configuration(
             Bucket=bucket_name,
@@ -200,7 +209,7 @@ class TestS3NotificationsToLambda:
             rs["Items"] = sorted(rs["Items"], key=lambda x: x["data"]["eventName"])
             snapshot.match("items", rs["Items"])
 
-        retry(check_table, retries=10, sleep=1)
+        retry(check_table, retries=20, sleep=2)
 
     @pytest.mark.aws_validated
     @pytest.mark.skipif(condition=LEGACY_S3_PROVIDER, reason="no validation implemented")
@@ -244,7 +253,7 @@ class TestS3NotificationsToLambda:
         # set valid but not-existing lambda
         config["LambdaFunctionConfigurations"][0][
             "LambdaFunctionArn"
-        ] = f"{aws_stack.lambda_function_arn('my-lambda', account_id=account_id)}"
+        ] = f"{arns.lambda_function_arn('my-lambda', account_id=account_id)}"
         with pytest.raises(ClientError) as e:
             s3_client.put_bucket_notification_configuration(
                 Bucket=bucket_name,

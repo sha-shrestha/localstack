@@ -1,6 +1,7 @@
 import copy
 import datetime
 import logging
+import os
 from typing import Dict
 
 from cryptography.hazmat.primitives import hashes
@@ -38,6 +39,8 @@ from localstack.aws.api.kms import (
     GenerateDataKeyResponse,
     GenerateDataKeyWithoutPlaintextRequest,
     GenerateDataKeyWithoutPlaintextResponse,
+    GenerateRandomRequest,
+    GenerateRandomResponse,
     GetKeyPolicyRequest,
     GetKeyPolicyResponse,
     GetKeyRotationStatusRequest,
@@ -87,7 +90,6 @@ from localstack.aws.api.kms import (
 )
 from localstack.services.kms.models import (
     KeyImportState,
-    KmsAlias,
     KmsCryptoKey,
     KmsGrant,
     KmsKey,
@@ -98,7 +100,7 @@ from localstack.services.kms.models import (
     validate_alias_name,
 )
 from localstack.services.plugins import ServiceLifecycleHook
-from localstack.utils.aws.aws_stack import kms_alias_arn
+from localstack.utils.aws.arns import kms_alias_arn
 from localstack.utils.collections import PaginatedList
 from localstack.utils.common import select_attributes
 from localstack.utils.strings import short_uid, to_bytes, to_str
@@ -466,6 +468,28 @@ class KmsProvider(KmsApi, ServiceLifecycleHook):
         )
         return GenerateDataKeyPairResponse(**result)
 
+    @handler("GenerateRandom", expand=False)
+    def generate_random(
+        self, context: RequestContext, request: GenerateRandomRequest
+    ) -> GenerateRandomResponse:
+        number_of_bytes = request.get("NumberOfBytes")
+        if number_of_bytes is None:
+            raise ValidationException("NumberOfBytes is required.")
+        if number_of_bytes > 1024:
+            raise ValidationException(
+                f"1 validation error detected: Value '{number_of_bytes}' at 'numberOfBytes' failed "
+                "to satisfy constraint: Member must have value less than or equal to 1024"
+            )
+        if number_of_bytes < 1:
+            raise ValidationException(
+                f"1 validation error detected: Value '{number_of_bytes}' at 'numberOfBytes' failed "
+                "to satisfy constraint: Member must have value greater than or equal to 1"
+            )
+
+        byte_string = os.urandom(number_of_bytes)
+
+        return GenerateRandomResponse(Plaintext=byte_string)
+
     @handler("GenerateDataKeyPairWithoutPlaintext", expand=False)
     def generate_data_key_pair_without_plaintext(
         self,
@@ -509,6 +533,7 @@ class KmsProvider(KmsApi, ServiceLifecycleHook):
         result.pop("Plaintext")
         return GenerateDataKeyWithoutPlaintextResponse(**result)
 
+    # Currently LocalStack only calculates SHA256 digests no matter what the signing algorithm is.
     @handler("Sign", expand=False)
     def sign(self, context: RequestContext, request: SignRequest) -> SignResponse:
         key = self._get_key(context, request.get("KeyId"))
@@ -518,7 +543,7 @@ class KmsProvider(KmsApi, ServiceLifecycleHook):
         #  https://docs.aws.amazon.com/kms/latest/developerguide/asymmetric-key-specs.html#key-spec-ecc
 
         signing_algorithm = request.get("SigningAlgorithm")
-        signature = key.sign(request.get("Message"), signing_algorithm)
+        signature = key.sign(request.get("Message"), request.get("MessageType"), signing_algorithm)
 
         result = {
             "KeyId": key.metadata["KeyId"],
@@ -527,6 +552,7 @@ class KmsProvider(KmsApi, ServiceLifecycleHook):
         }
         return SignResponse(**result)
 
+    # Currently LocalStack only calculates SHA256 digests no matter what the signing algorithm is.
     @handler("Verify", expand=False)
     def verify(self, context: RequestContext, request: VerifyRequest) -> VerifyResponse:
         key = self._get_key(context, request.get("KeyId"))
@@ -534,7 +560,10 @@ class KmsProvider(KmsApi, ServiceLifecycleHook):
 
         signing_algorithm = request.get("SigningAlgorithm")
         is_signature_valid = key.verify(
-            request.get("Message"), signing_algorithm, request.get("Signature")
+            request.get("Message"),
+            request.get("MessageType"),
+            signing_algorithm,
+            request.get("Signature"),
         )
 
         result = {
@@ -694,8 +723,7 @@ class KmsProvider(KmsApi, ServiceLifecycleHook):
             context, request.get("TargetKeyId"), enabled_key_allowed=True, disabled_key_allowed=True
         )
         request["TargetKeyId"] = key.metadata.get("KeyId")
-        alias = KmsAlias(request)
-        store.aliases[alias_name] = alias
+        store.create_alias(request)
 
     @handler("DeleteAlias", expand=False)
     def delete_alias(self, context: RequestContext, request: DeleteAliasRequest) -> None:

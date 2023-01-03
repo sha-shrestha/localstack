@@ -37,6 +37,7 @@ FUNCTION_MAX_UNZIPPED_SIZE = 262144000
 THIS_FOLDER = os.path.dirname(os.path.realpath(__file__))
 TEST_LAMBDA_PYTHON = os.path.join(THIS_FOLDER, "functions/lambda_integration.py")
 TEST_LAMBDA_PYTHON_ECHO = os.path.join(THIS_FOLDER, "functions/lambda_echo.py")
+TEST_LAMBDA_PYTHON_ECHO_ZIP = os.path.join(THIS_FOLDER, "functions/echo.zip")
 TEST_LAMBDA_PYTHON_VERSION = os.path.join(THIS_FOLDER, "functions/lambda_python_version.py")
 TEST_LAMBDA_PYTHON_UNHANDLED_ERROR = os.path.join(
     THIS_FOLDER, "functions/lambda_unhandled_error.py"
@@ -76,6 +77,7 @@ TEST_LAMBDA_URL = os.path.join(THIS_FOLDER, "functions/lambda_url.js")
 TEST_LAMBDA_CACHE_NODEJS = os.path.join(THIS_FOLDER, "functions/lambda_cache.js")
 TEST_LAMBDA_CACHE_PYTHON = os.path.join(THIS_FOLDER, "functions/lambda_cache.py")
 TEST_LAMBDA_TIMEOUT_PYTHON = os.path.join(THIS_FOLDER, "functions/lambda_timeout.py")
+TEST_LAMBDA_TIMEOUT_ENV_PYTHON = os.path.join(THIS_FOLDER, "functions/lambda_timeout_env.py")
 TEST_LAMBDA_SLEEP_ENVIRONMENT = os.path.join(THIS_FOLDER, "functions/lambda_sleep_environment.py")
 TEST_LAMBDA_INTROSPECT_PYTHON = os.path.join(THIS_FOLDER, "functions/lambda_introspect.py")
 TEST_LAMBDA_VERSION = os.path.join(THIS_FOLDER, "functions/lambda_version.py")
@@ -172,15 +174,7 @@ if is_old_provider():
     )
 else:
     pytestmark = pytest.mark.skip_snapshot_verify(
-        paths=[
-            "$..State",
-            "$..StateReason",
-            "$..StateReasonCode",
-            "$..CodeSize",
-            "$..LastUpdateStatus",
-            "$..LastUpdateStatusReason",
-            "$..LastUpdateStatusReasonCode",
-        ],
+        paths=["$..CodeSize"],
     )
 
 
@@ -347,7 +341,6 @@ class TestLambdaBehavior:
 
     @pytest.mark.skipif(is_old_provider(), reason="old provider")
     @pytest.mark.aws_validated
-    @pytest.mark.skipif(not is_old_provider(), reason="Not yet implemented")
     def test_lambda_invoke_with_timeout(
         self,
         lambda_client,
@@ -378,6 +371,13 @@ class TestLambdaBehavior:
         snapshot.match("invoke-result", result)
 
         log_group_name = f"/aws/lambda/{func_name}"
+
+        def _log_stream_available():
+            result = logs_client.describe_log_streams(logGroupName=log_group_name)["logStreams"]
+            return len(result) > 0
+
+        wait_until(_log_stream_available, strategy="linear")
+
         ls_result = logs_client.describe_log_streams(logGroupName=log_group_name)
         log_stream_name = ls_result["logStreams"][0]["logStreamName"]
 
@@ -436,23 +436,114 @@ class TestLambdaBehavior:
 
         wait_until(_assert_log_output, strategy="linear")
 
+    @pytest.mark.skipif(is_old_provider(), reason="old provider")
+    @pytest.mark.aws_validated
+    def test_lambda_invoke_timed_out_environment_reuse(
+        self,
+        lambda_client,
+        create_lambda_function,
+        logs_client,
+        snapshot,
+    ):
+        """Test checking if a timeout leads to a new environment with a new filesystem (and lost /tmp) or not"""
+        regex = re.compile(r".*\s(?P<uuid>[-a-z0-9]+) Task timed out after \d.\d+ seconds")
+        snapshot.add_transformer(
+            KeyValueBasedTransformer(
+                lambda k, v: regex.search(v).group("uuid") if k == "errorMessage" else None,
+                "<timeout_error_msg>",
+                replace_reference=False,
+            )
+        )
 
-@pytest.mark.skipif(not is_old_provider(), reason="Not yet implemented")
+        func_name = f"test_lambda_{short_uid()}"
+        create_result = create_lambda_function(
+            func_name=func_name,
+            handler_file=TEST_LAMBDA_TIMEOUT_ENV_PYTHON,
+            runtime=Runtime.python3_9,
+            client=lambda_client,
+            timeout=1,
+        )
+        snapshot.match("create-result", create_result)
+        file_content = "some-content"
+        set_number = 42
+
+        result = lambda_client.invoke(
+            FunctionName=func_name, Payload=json.dumps({"write-file": file_content})
+        )
+        snapshot.match("invoke-result-file-write", result)
+        result = lambda_client.invoke(
+            FunctionName=func_name, Payload=json.dumps({"read-file": True})
+        )
+        snapshot.match("invoke-result-file-read", result)
+        result = lambda_client.invoke(
+            FunctionName=func_name, Payload=json.dumps({"set-number": set_number})
+        )
+        snapshot.match("invoke-result-set-number", result)
+        result = lambda_client.invoke(
+            FunctionName=func_name, Payload=json.dumps({"read-number": True})
+        )
+        snapshot.match("invoke-result-read-number", result)
+        # file is written, let's let the function timeout and check if it is still there
+
+        result = lambda_client.invoke(FunctionName=func_name, Payload=json.dumps({"sleep": 2}))
+        snapshot.match("invoke-result-timed-out", result)
+        log_group_name = f"/aws/lambda/{func_name}"
+
+        def _log_stream_available():
+            result = logs_client.describe_log_streams(logGroupName=log_group_name)["logStreams"]
+            return len(result) > 0
+
+        wait_until(_log_stream_available, strategy="linear")
+
+        ls_result = logs_client.describe_log_streams(logGroupName=log_group_name)
+        log_stream_name = ls_result["logStreams"][0]["logStreamName"]
+
+        def assert_events():
+            log_events = logs_client.get_log_events(
+                logGroupName=log_group_name, logStreamName=log_stream_name
+            )["events"]
+
+            assert any(["starting wait" in e["message"] for e in log_events])
+            # TODO: this part is a bit flaky, at least locally with old provider
+            assert not any(["done waiting" in e["message"] for e in log_events])
+
+        retry(assert_events, retries=15)
+
+        # check if, for the next normal invocation, the file is still there:
+        result = lambda_client.invoke(
+            FunctionName=func_name, Payload=json.dumps({"read-file": True})
+        )
+        snapshot.match("invoke-result-file-read-after-timeout", result)
+        result = lambda_client.invoke(
+            FunctionName=func_name, Payload=json.dumps({"read-number": True})
+        )
+        snapshot.match("invoke-result-read-number-after-timeout", result)
+
+
+@pytest.mark.skip_snapshot_verify(
+    condition=is_old_provider,
+    paths=[
+        "$..context",
+        "$..event.headers.x-forwarded-proto",
+        "$..event.headers.x-forwarded-for",
+        "$..event.headers.x-forwarded-port",
+        "$..event.headers.x-amzn-lambda-forwarded-client-ip",
+        "$..event.headers.x-amzn-lambda-forwarded-host",
+        "$..event.headers.x-amzn-lambda-proxy-auth",
+        "$..event.headers.x-amzn-lambda-proxying-cell",
+        "$..event.headers.x-amzn-trace-id",
+    ],
+)
+@pytest.mark.skip_snapshot_verify(
+    paths=[
+        "$..event.headers.x-forwarded-proto",
+        "$..event.headers.x-forwarded-port",
+        "$..event.headers.x-amzn-trace-id",
+    ],
+)
 class TestLambdaURL:
-    @pytest.mark.skip_snapshot_verify(
-        condition=is_old_provider,
-        paths=[
-            "$..context",
-            "$..event.headers.x-forwarded-proto",
-            "$..event.headers.x-forwarded-for",
-            "$..event.headers.x-forwarded-port",
-            "$..event.headers.x-amzn-lambda-forwarded-client-ip",
-            "$..event.headers.x-amzn-lambda-forwarded-host",
-            "$..event.headers.x-amzn-lambda-proxy-auth",
-            "$..event.headers.x-amzn-lambda-proxying-cell",
-            "$..event.headers.x-amzn-trace-id",
-        ],
-    )
+    # TODO: add more tests
+
     @pytest.mark.aws_validated
     def test_lambda_url_invocation(self, lambda_client, create_lambda_function, snapshot):
         snapshot.add_transformers_list(
@@ -539,6 +630,7 @@ class TestLambdaURL:
         snapshot.match("lambda_url_invocation", json.loads(result.content))
 
         result = safe_requests.post(url, data="text", headers={"Content-Type": "text/plain"})
+        assert result.status_code == 200
         event = json.loads(result.content)["event"]
         assert event["body"] == "text"
         assert event["isBase64Encoded"] is False
@@ -547,6 +639,45 @@ class TestLambdaURL:
         event = json.loads(result.content)["event"]
         assert "Body" not in event
         assert event["isBase64Encoded"] is False
+
+    @pytest.mark.aws_validated
+    @pytest.mark.skipif(condition=is_old_provider(), reason="not implemented")
+    def test_lambda_url_invocation_exception(self, lambda_client, create_lambda_function, snapshot):
+        snapshot.add_transformer(
+            snapshot.transform.key_value("FunctionUrl", reference_replacement=False)
+        )
+        function_name = f"test-function-{short_uid()}"
+
+        create_lambda_function(
+            func_name=function_name,
+            handler_file=TEST_LAMBDA_PYTHON_UNHANDLED_ERROR,
+            runtime=Runtime.python3_9,
+        )
+        get_fn_result = lambda_client.get_function(FunctionName=function_name)
+        snapshot.match("get_fn_result", get_fn_result)
+
+        url_config = lambda_client.create_function_url_config(
+            FunctionName=function_name,
+            AuthType="NONE",
+        )
+        snapshot.match("create_lambda_url_config", url_config)
+
+        permissions_response = lambda_client.add_permission(
+            FunctionName=function_name,
+            StatementId="urlPermission",
+            Action="lambda:InvokeFunctionUrl",
+            Principal="*",
+            FunctionUrlAuthType="NONE",
+        )
+        snapshot.match("add_permission", permissions_response)
+
+        url = url_config["FunctionUrl"]
+
+        result = safe_requests.post(
+            url, data=b"{}", headers={"User-Agent": "python-requests/testing"}
+        )
+        assert to_str(result.content) == "Internal Server Error"
+        assert result.status_code == 502
 
 
 class TestLambdaFeatures:
@@ -837,9 +968,36 @@ class TestLambdaFeatures:
         retry(check_logs, retries=15)
 
 
-@pytest.mark.skipif(not is_old_provider(), reason="Not yet implemented")
 @pytest.mark.skipif(condition=is_old_provider(), reason="not supported")
 class TestLambdaConcurrency:
+    @pytest.mark.aws_validated
+    def test_lambda_concurrency_crud(self, snapshot, create_lambda_function, lambda_client):
+        func_name = f"fn-concurrency-{short_uid()}"
+        create_lambda_function(
+            func_name=func_name,
+            handler_file=TEST_LAMBDA_PYTHON_ECHO,
+            runtime=Runtime.python3_9,
+        )
+
+        default_concurrency_result = lambda_client.get_function_concurrency(FunctionName=func_name)
+        snapshot.match("get_function_concurrency_default", default_concurrency_result)
+
+        # 0 should always succeed independent of the UnreservedConcurrentExecution limits
+        reserved_concurrency_result = lambda_client.put_function_concurrency(
+            FunctionName=func_name, ReservedConcurrentExecutions=0
+        )
+        snapshot.match("put_function_concurrency", reserved_concurrency_result)
+
+        updated_concurrency_result = lambda_client.get_function_concurrency(FunctionName=func_name)
+        snapshot.match("get_function_concurrency_updated", updated_concurrency_result)
+        assert updated_concurrency_result["ReservedConcurrentExecutions"] == 0
+
+        lambda_client.delete_function_concurrency(FunctionName=func_name)
+
+        deleted_concurrency_result = lambda_client.get_function_concurrency(FunctionName=func_name)
+        snapshot.match("get_function_concurrency_deleted", deleted_concurrency_result)
+
+    @pytest.mark.skipif(not is_old_provider(), reason="Not yet implemented")
     @pytest.mark.aws_validated
     def test_lambda_concurrency_block(self, snapshot, create_lambda_function, lambda_client):
         """
@@ -891,7 +1049,7 @@ class TestLambdaConcurrency:
             )
         snapshot.match("invoke_latest_first_exc", e.value.response)
 
-        # but we can call the version with provisioned cocurrency
+        # but we can call the version with provisioned concurrency
         invoke_v1_after_block = lambda_client.invoke(
             FunctionName=func_name, Qualifier=v1, Payload=json.dumps({"hello": "world"})
         )
@@ -904,6 +1062,7 @@ class TestLambdaConcurrency:
             )
         snapshot.match("invoke_latest_second_exc", e.value.response)
 
+    @pytest.mark.skipif(not is_old_provider(), reason="Not yet implemented")
     @pytest.mark.skipif(condition=is_aws(), reason="very slow (only execute when needed)")
     @pytest.mark.aws_validated
     def test_lambda_provisioned_concurrency_moves_with_alias(
@@ -1093,6 +1252,14 @@ class TestLambdaVersions:
             FunctionName=function_name, Payload=b"{}"
         )
         snapshot.match("invocation_result_latest_end", invocation_result_latest_end)
+        invocation_result_v2 = lambda_client.invoke(
+            FunctionName=function_name, Qualifier=second_publish_response["Version"], Payload=b"{}"
+        )
+        snapshot.match("invocation_result_v2_end", invocation_result_v2)
+        invocation_result_v1 = lambda_client.invoke(
+            FunctionName=function_name, Qualifier=first_publish_response["Version"], Payload=b"{}"
+        )
+        snapshot.match("invocation_result_v1_end", invocation_result_v1)
 
 
 @pytest.mark.skipif(condition=is_old_provider(), reason="not supported")

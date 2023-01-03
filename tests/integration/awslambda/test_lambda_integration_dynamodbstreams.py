@@ -1,4 +1,5 @@
 import json
+import math
 import time
 
 import pytest
@@ -74,11 +75,6 @@ def get_lambda_logs_event(logs_client):
 @pytest.mark.skip_snapshot_verify(
     condition=is_old_provider,
     paths=[
-        "$..TableDescription.BillingModeSummary.LastUpdateToPayPerRequestDateTime",
-        "$..TableDescription.ProvisionedThroughput.LastDecreaseDateTime",
-        "$..TableDescription.ProvisionedThroughput.LastIncreaseDateTime",
-        "$..TableDescription.StreamSpecification",
-        "$..TableDescription.TableStatus",
         "$..BisectBatchOnFunctionError",
         "$..DestinationConfig",
         "$..FunctionResponseTypes",
@@ -89,6 +85,16 @@ def get_lambda_logs_event(logs_client):
         "$..State",
         "$..Topics",
         "$..TumblingWindowInSeconds",
+    ],
+)
+@pytest.mark.skip_snapshot_verify(
+    paths=[
+        # dynamodb issues, not related to lambda
+        "$..TableDescription.BillingModeSummary.LastUpdateToPayPerRequestDateTime",
+        "$..TableDescription.ProvisionedThroughput.LastDecreaseDateTime",
+        "$..TableDescription.ProvisionedThroughput.LastIncreaseDateTime",
+        "$..TableDescription.StreamSpecification",
+        "$..TableDescription.TableStatus",
         "$..Records..dynamodb.SizeBytes",
         "$..Records..eventVersion",
     ],
@@ -160,6 +166,11 @@ class TestDynamoDBEventSourceMapping:
 
         event_logs = retry(_send_and_receive_events, retries=3)
         snapshot.match("event_logs", event_logs)
+        # check if the timestamp has the correct format
+        timestamp = event_logs[0]["Records"][0]["dynamodb"]["ApproximateCreationDateTime"]
+        # check if the timestamp has same amount of numbers before the comma as the current timestamp
+        # this will fail in november 2286, if this code is still around by then, read this comment and update to 10
+        assert int(math.log10(timestamp)) == 9
 
     @pytest.mark.aws_validated
     def test_disabled_dynamodb_event_source_mapping(
@@ -256,6 +267,7 @@ class TestDynamoDBEventSourceMapping:
             stream_view_type="NEW_IMAGE",
         )
         snapshot.match("create_dynamodb_table_response", create_dynamodb_table_response)
+        _await_dynamodb_table_active(dynamodb_client, ddb_table)
         latest_stream_arn = create_dynamodb_table_response["TableDescription"]["LatestStreamArn"]
         result = lambda_client.create_event_source_mapping(
             FunctionName=function_name,
@@ -263,19 +275,20 @@ class TestDynamoDBEventSourceMapping:
             StartingPosition="TRIM_HORIZON",
         )
         snapshot.match("create_event_source_mapping_result", result)
+        _await_event_source_mapping_enabled(lambda_client, result["UUID"])
+        cleanups.append(lambda: dynamodb_client.delete_table(TableName=ddb_table))
+
         event_source_mapping_uuid = result["UUID"]
         cleanups.append(
             lambda: lambda_client.delete_event_source_mapping(UUID=event_source_mapping_uuid)
         )
-        _await_dynamodb_table_active(dynamodb_client, ddb_table)
         dynamodb_client.delete_table(TableName=ddb_table)
-        result = lambda_client.list_event_source_mappings(EventSourceArn=latest_stream_arn)
-        snapshot.match("list_event_source_mapping_result", result)
+        list_esm = lambda_client.list_event_source_mappings(EventSourceArn=latest_stream_arn)
+        snapshot.match("list_event_source_mapping_result", list_esm)
 
     @pytest.mark.aws_validated
     # FIXME last three skip verification entries are purely due to numbering mismatches
     @pytest.mark.skip_snapshot_verify(
-        condition=is_old_provider,
         paths=[
             "$..Messages..Body.requestContext.approximateInvokeCount",
             "$..Messages..Body.requestContext.functionArn",

@@ -24,7 +24,6 @@ from localstack.constants import (
 from localstack.http import Router
 from localstack.http.adapters import create_request_from_parts
 from localstack.http.dispatcher import Handler, handler_dispatcher
-from localstack.http.router import RegexConverter
 from localstack.runtime import events
 from localstack.services.generic_proxy import ProxyListener, modify_and_forward, start_proxy_server
 from localstack.services.infra import PROXY_LISTENERS
@@ -322,9 +321,7 @@ def get_service_port_for_account(service, headers):
 
 PROXY_LISTENER_EDGE = ProxyListenerEdge()
 
-ROUTER: Router[Handler] = Router(
-    dispatcher=handler_dispatcher(), converters={"regex": RegexConverter}
-)
+ROUTER: Router[Handler] = Router(dispatcher=handler_dispatcher())
 """This special Router is part of the edge proxy. Use the router to inject custom handlers that are handled before
 the actual AWS service call is made."""
 
@@ -495,7 +492,9 @@ def run_process_as_sudo(component, port, asynchronous=False, env_vars=None):
         run(shell_cmd, outfile=subprocess.PIPE, print_error=False, env_vars=env_vars)
 
     LOG.debug("Running command as sudo: %s", shell_cmd)
-    result = start_thread(run_command, quiet=True) if asynchronous else run_command()
+    result = (
+        start_thread(run_command, quiet=True, name="sudo-edge") if asynchronous else run_command()
+    )
     return result
 
 

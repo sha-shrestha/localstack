@@ -7,6 +7,7 @@ import struct
 import uuid
 from collections import namedtuple
 from dataclasses import dataclass
+from hashlib import sha256
 from typing import Dict, List
 
 from cryptography.exceptions import InvalidSignature
@@ -23,13 +24,15 @@ from localstack.aws.api.kms import (
     DisabledException,
     EncryptionContextType,
     KeyMetadata,
+    KMSInvalidSignatureException,
     KMSInvalidStateException,
+    MessageType,
     NotFoundException,
     SigningAlgorithmSpec,
     UnsupportedOperationException,
 )
 from localstack.services.stores import AccountRegionBundle, BaseStore, LocalAttribute
-from localstack.utils.aws.aws_stack import kms_alias_arn, kms_key_arn
+from localstack.utils.aws.arns import kms_alias_arn, kms_key_arn
 from localstack.utils.crypto import decrypt, encrypt
 from localstack.utils.strings import long_uid
 
@@ -223,19 +226,33 @@ class KmsKey:
     def decrypt(self, ciphertext: Ciphertext) -> bytes:
         return decrypt(self.crypto_key.key_material, ciphertext.ciphertext, ciphertext.iv)
 
-    def sign(self, data: bytes, signing_algorithm: SigningAlgorithmSpec) -> bytes:
+    def _get_digest(self, data: bytes) -> bytes:
+        return sha256(data).digest()
+
+    def sign(
+        self, data: bytes, message_type: MessageType, signing_algorithm: SigningAlgorithmSpec
+    ) -> bytes:
         kwargs = self._construct_sign_verify_kwargs(signing_algorithm)
+        if message_type != MessageType.DIGEST:
+            data = self._get_digest(data)
         return self.crypto_key.key.sign(data=data, **kwargs)
 
     def verify(
-        self, data: bytes, signing_algorithm: SigningAlgorithmSpec, signature: bytes
+        self,
+        data: bytes,
+        message_type: MessageType,
+        signing_algorithm: SigningAlgorithmSpec,
+        signature: bytes,
     ) -> bool:
+        kwargs = self._construct_sign_verify_kwargs(signing_algorithm)
+        if message_type != MessageType.DIGEST:
+            data = self._get_digest(data)
         try:
-            kwargs = self._construct_sign_verify_kwargs(signing_algorithm)
             self.crypto_key.key.public_key().verify(signature=signature, data=data, **kwargs)
             return True
         except InvalidSignature:
-            return False
+            # AWS itself raises this exception without any additional message.
+            raise KMSInvalidSignatureException()
 
     def _construct_sign_verify_kwargs(self, signing_algorithm: SigningAlgorithmSpec) -> Dict:
         kwargs = {}
@@ -286,11 +303,11 @@ class KmsKey:
         self.metadata = KeyMetadata()
         # Metadata fields coming from a creation request
         #
-        # Please keep in ind that tags of a key could be present in the request, they are not a part of metadata. At
-        # least in the sense of DescribeKey not returning them with the rest of the metadata. Instead, tags are more
-        # like aliases:
+        # We do not include tags into the metadata. Tags might be present in a key creation request, but our metadata
+        # only contains data displayed by DescribeKey. And tags are not there:
         # https://docs.aws.amazon.com/kms/latest/APIReference/API_DescribeKey.html
         # "DescribeKey does not return the following information: ... Tags on the KMS key."
+
         self.metadata["Description"] = create_key_request.get("Description") or ""
         self.metadata["KeyUsage"] = create_key_request.get("KeyUsage") or "ENCRYPT_DECRYPT"
         self.metadata["MultiRegion"] = create_key_request.get("MultiRegion") or False
@@ -592,8 +609,7 @@ class KmsStore(BaseStore):
         create_key_request = {}
         key_id = self.create_key(create_key_request, account_id, region).metadata.get("KeyId")
         create_alias_request = CreateAliasRequest(AliasName=alias_name, TargetKeyId=key_id)
-        alias = KmsAlias(create_alias_request, account_id, region)
-        self.aliases[alias_name] = alias
+        self.create_alias(create_alias_request, account_id, region)
 
     # In KMS, keys can be identified by
     # - key ID

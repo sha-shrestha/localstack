@@ -18,6 +18,7 @@ from localstack.aws.api.s3 import (
     EventList,
     LambdaFunctionArn,
     LambdaFunctionConfiguration,
+    NoSuchKey,
     NotificationConfiguration,
     NotificationConfigurationFilter,
     NotificationId,
@@ -34,8 +35,8 @@ from localstack.services.s3.utils import (
     get_bucket_from_moto,
     get_key_from_moto_bucket,
 )
-from localstack.utils.aws import aws_stack
-from localstack.utils.aws.aws_stack import ArnData, parse_arn
+from localstack.utils.aws import arns, aws_stack
+from localstack.utils.aws.arns import ArnData, parse_arn
 from localstack.utils.strings import short_uid
 from localstack.utils.time import timestamp_millis
 
@@ -45,9 +46,11 @@ EVENT_OPERATION_MAP = {
     "PutObject": Event.s3_ObjectCreated_Put,
     "CopyObject": Event.s3_ObjectCreated_Copy,
     "CompleteMultipartUpload": Event.s3_ObjectCreated_CompleteMultipartUpload,
+    "PostObject": Event.s3_ObjectCreated_Post,
     "PutObjectTagging": Event.s3_ObjectTagging_Put,
     "DeleteObjectTagging": Event.s3_ObjectTagging_Delete,
     "DeleteObject": Event.s3_ObjectRemoved_Delete,
+    "DeleteObjects": Event.s3_ObjectRemoved_Delete,
 }
 
 HEADER_AMZN_XRAY = "X-Amzn-Trace-Id"
@@ -89,13 +92,30 @@ class S3EventNotificationContext:
     key_version_id: str
 
     @classmethod
-    def from_request_context(cls, request_context: RequestContext) -> "S3EventNotificationContext":
+    def from_request_context(
+        cls, request_context: RequestContext, key_name: str = None, allow_non_existing_key=False
+    ) -> "S3EventNotificationContext":
+        """
+        Create an S3EventNotificationContext from a RequestContext.
+        The key is not always present in the request context depending on the event type. In that case, we can use
+        a provided one.
+        :param request_context: RequestContext
+        :param key_name: Optional, in case it's not provided in the RequestContext
+        :param allow_non_existing_key: Optional, indicates that a dummy Key should be created, if it does not exist (required for delete_objects)
+        :return: S3EventNotificationContext
+        """
         bucket_name = request_context.service_request["Bucket"]
         moto_backend = get_moto_s3_backend(request_context)
         bucket: FakeBucket = get_bucket_from_moto(moto_backend, bucket=bucket_name)
-        key: FakeKey = get_key_from_moto_bucket(
-            moto_bucket=bucket, key=request_context.service_request["Key"]
-        )
+        try:
+            key: FakeKey = get_key_from_moto_bucket(
+                moto_bucket=bucket, key=key_name or request_context.service_request["Key"]
+            )
+        except NoSuchKey as ex:
+            if allow_non_existing_key:
+                key: FakeKey = FakeKey(key_name, "")
+            else:
+                raise ex
         return cls(
             event_type=EVENT_OPERATION_MAP.get(request_context.operation.wire_name, ""),
             region=request_context.region,
@@ -287,6 +307,7 @@ class SqsNotifier(BaseNotifier):
                 QueueName=arn_data["resource"], QueueOwnerAWSAccountId=arn_data["account"]
             )
         except ClientError:
+            LOG.exception("Could not validate the notification destination %s", arn)
             raise _create_invalid_argument_exc(
                 "Unable to validate the following destination configurations",
                 name=arn,
@@ -301,7 +322,7 @@ class SqsNotifier(BaseNotifier):
         parsed_arn = parse_arn(queue_arn)
         sqs_client = aws_stack.connect_to_service("sqs", region_name=parsed_arn["region"])
         try:
-            queue_url = aws_stack.sqs_queue_url_for_arn(queue_arn)
+            queue_url = arns.sqs_queue_url_for_arn(queue_arn)
             system_attributes = {}
             if ctx.xray:
                 system_attributes["AWSTraceHeader"] = {
@@ -351,7 +372,7 @@ class SnsNotifier(BaseNotifier):
         message = json.dumps(event_payload)
         topic_arn = config["TopicArn"]
 
-        region_name = aws_stack.extract_region_from_arn(topic_arn)
+        region_name = arns.extract_region_from_arn(topic_arn)
         sns_client = aws_stack.connect_to_service("sns", region_name=region_name)
         try:
             sns_client.publish(
@@ -392,9 +413,9 @@ class LambdaNotifier(BaseNotifier):
         payload = json.dumps(event_payload)
         lambda_arn = config["LambdaFunctionArn"]
 
-        region_name = aws_stack.extract_region_from_arn(lambda_arn)
+        region_name = arns.extract_region_from_arn(lambda_arn)
         lambda_client = aws_stack.connect_to_service("lambda", region_name=region_name)
-        lambda_function_config = aws_stack.lambda_function_name(lambda_arn)
+        lambda_function_config = arns.lambda_function_name(lambda_arn)
         try:
             lambda_client.invoke(
                 FunctionName=lambda_function_config,

@@ -9,7 +9,10 @@ else:
 from localstack.aws.api import RequestContext, ServiceException, ServiceRequest, handler
 
 AccessPolicy = str
+AccountId = str
+AmazonResourceName = str
 Arn = str
+DataProtectionPolicyDocument = str
 Days = int
 DefaultValue = float
 Descending = bool
@@ -32,10 +35,13 @@ FilterCount = int
 FilterName = str
 FilterPattern = str
 ForceUpdate = bool
+IncludeLinkedAccounts = bool
 Interleaved = bool
 KmsKeyId = str
 LogEventIndex = int
+LogGroupIdentifier = str
 LogGroupName = str
+LogGroupNamePattern = str
 LogRecordPointer = str
 LogStreamName = str
 LogStreamSearchedCompletely = bool
@@ -62,7 +68,15 @@ TagKey = str
 TagValue = str
 TargetArn = str
 Token = str
+Unmask = bool
 Value = str
+
+
+class DataProtectionStatus(str):
+    ACTIVATED = "ACTIVATED"
+    DELETED = "DELETED"
+    ARCHIVED = "ARCHIVED"
+    DISABLED = "DISABLED"
 
 
 class Distribution(str):
@@ -197,10 +211,20 @@ class ServiceUnavailableException(ServiceException):
     status_code: int = 400
 
 
+class TooManyTagsException(ServiceException):
+    code: str = "TooManyTagsException"
+    sender_fault: bool = False
+    status_code: int = 400
+    resourceName: Optional[AmazonResourceName]
+
+
 class UnrecognizedClientException(ServiceException):
     code: str = "UnrecognizedClientException"
     sender_fault: bool = False
     status_code: int = 400
+
+
+AccountIds = List[AccountId]
 
 
 class AssociateKmsKeyRequest(ServiceRequest):
@@ -244,6 +268,10 @@ class CreateLogGroupRequest(ServiceRequest):
 class CreateLogStreamRequest(ServiceRequest):
     logGroupName: LogGroupName
     logStreamName: LogStreamName
+
+
+class DeleteDataProtectionPolicyRequest(ServiceRequest):
+    logGroupIdentifier: LogGroupIdentifier
 
 
 class DeleteDestinationRequest(ServiceRequest):
@@ -349,9 +377,12 @@ class DescribeExportTasksResponse(TypedDict, total=False):
 
 
 class DescribeLogGroupsRequest(ServiceRequest):
+    accountIdentifiers: Optional[AccountIds]
     logGroupNamePrefix: Optional[LogGroupName]
+    logGroupNamePattern: Optional[LogGroupNamePattern]
     nextToken: Optional[NextToken]
     limit: Optional[DescribeLimit]
+    includeLinkedAccounts: Optional[IncludeLinkedAccounts]
 
 
 StoredBytes = int
@@ -365,6 +396,7 @@ class LogGroup(TypedDict, total=False):
     arn: Optional[Arn]
     storedBytes: Optional[StoredBytes]
     kmsKeyId: Optional[KmsKeyId]
+    dataProtectionStatus: Optional[DataProtectionStatus]
 
 
 LogGroups = List[LogGroup]
@@ -377,6 +409,7 @@ class DescribeLogGroupsResponse(TypedDict, total=False):
 
 class DescribeLogStreamsRequest(ServiceRequest):
     logGroupName: LogGroupName
+    logGroupIdentifier: Optional[LogGroupIdentifier]
     logStreamNamePrefix: Optional[LogStreamName]
     orderBy: Optional[OrderBy]
     descending: Optional[Descending]
@@ -546,6 +579,7 @@ InputLogStreamNames = List[LogStreamName]
 
 class FilterLogEventsRequest(ServiceRequest):
     logGroupName: LogGroupName
+    logGroupIdentifier: Optional[LogGroupIdentifier]
     logStreamNames: Optional[InputLogStreamNames]
     logStreamNamePrefix: Optional[LogStreamName]
     startTime: Optional[Timestamp]
@@ -554,6 +588,7 @@ class FilterLogEventsRequest(ServiceRequest):
     nextToken: Optional[NextToken]
     limit: Optional[EventsLimit]
     interleaved: Optional[Interleaved]
+    unmask: Optional[Unmask]
 
 
 class SearchedLogStream(TypedDict, total=False):
@@ -581,14 +616,26 @@ class FilterLogEventsResponse(TypedDict, total=False):
     nextToken: Optional[NextToken]
 
 
+class GetDataProtectionPolicyRequest(ServiceRequest):
+    logGroupIdentifier: LogGroupIdentifier
+
+
+class GetDataProtectionPolicyResponse(TypedDict, total=False):
+    logGroupIdentifier: Optional[LogGroupIdentifier]
+    policyDocument: Optional[DataProtectionPolicyDocument]
+    lastUpdatedTime: Optional[Timestamp]
+
+
 class GetLogEventsRequest(ServiceRequest):
     logGroupName: LogGroupName
+    logGroupIdentifier: Optional[LogGroupIdentifier]
     logStreamName: LogStreamName
     startTime: Optional[Timestamp]
     endTime: Optional[Timestamp]
     nextToken: Optional[NextToken]
     limit: Optional[EventsLimit]
     startFromHead: Optional[StartFromHead]
+    unmask: Optional[Unmask]
 
 
 class OutputLogEvent(TypedDict, total=False):
@@ -609,6 +656,7 @@ class GetLogEventsResponse(TypedDict, total=False):
 class GetLogGroupFieldsRequest(ServiceRequest):
     logGroupName: LogGroupName
     time: Optional[Timestamp]
+    logGroupIdentifier: Optional[LogGroupIdentifier]
 
 
 class LogGroupField(TypedDict, total=False):
@@ -625,6 +673,7 @@ class GetLogGroupFieldsResponse(TypedDict, total=False):
 
 class GetLogRecordRequest(ServiceRequest):
     logRecordPointer: LogRecordPointer
+    unmask: Optional[Unmask]
 
 
 LogRecord = Dict[Field, Value]
@@ -667,12 +716,23 @@ class InputLogEvent(TypedDict, total=False):
 InputLogEvents = List[InputLogEvent]
 
 
+class ListTagsForResourceRequest(ServiceRequest):
+    resourceArn: AmazonResourceName
+
+
+class ListTagsForResourceResponse(TypedDict, total=False):
+    tags: Optional[Tags]
+
+
 class ListTagsLogGroupRequest(ServiceRequest):
     logGroupName: LogGroupName
 
 
 class ListTagsLogGroupResponse(TypedDict, total=False):
     tags: Optional[Tags]
+
+
+LogGroupIdentifiers = List[LogGroupIdentifier]
 
 
 class MetricFilterMatchRecord(TypedDict, total=False):
@@ -682,6 +742,17 @@ class MetricFilterMatchRecord(TypedDict, total=False):
 
 
 MetricFilterMatches = List[MetricFilterMatchRecord]
+
+
+class PutDataProtectionPolicyRequest(ServiceRequest):
+    logGroupIdentifier: LogGroupIdentifier
+    policyDocument: DataProtectionPolicyDocument
+
+
+class PutDataProtectionPolicyResponse(TypedDict, total=False):
+    logGroupIdentifier: Optional[LogGroupIdentifier]
+    policyDocument: Optional[DataProtectionPolicyDocument]
+    lastUpdatedTime: Optional[Timestamp]
 
 
 class PutDestinationPolicyRequest(ServiceRequest):
@@ -694,6 +765,7 @@ class PutDestinationRequest(ServiceRequest):
     destinationName: DestinationName
     targetArn: TargetArn
     roleArn: RoleArn
+    tags: Optional[Tags]
 
 
 class PutDestinationResponse(TypedDict, total=False):
@@ -762,6 +834,7 @@ class PutSubscriptionFilterRequest(ServiceRequest):
 class StartQueryRequest(ServiceRequest):
     logGroupName: Optional[LogGroupName]
     logGroupNames: Optional[LogGroupNames]
+    logGroupIdentifiers: Optional[LogGroupIdentifiers]
     startTime: Timestamp
     endTime: Timestamp
     queryString: QueryString
@@ -780,11 +853,17 @@ class StopQueryResponse(TypedDict, total=False):
     success: Optional[Success]
 
 
+TagKeyList = List[TagKey]
 TagList = List[TagKey]
 
 
 class TagLogGroupRequest(ServiceRequest):
     logGroupName: LogGroupName
+    tags: Tags
+
+
+class TagResourceRequest(ServiceRequest):
+    resourceArn: AmazonResourceName
     tags: Tags
 
 
@@ -803,6 +882,11 @@ class TestMetricFilterResponse(TypedDict, total=False):
 class UntagLogGroupRequest(ServiceRequest):
     logGroupName: LogGroupName
     tags: TagList
+
+
+class UntagResourceRequest(ServiceRequest):
+    resourceArn: AmazonResourceName
+    tagKeys: TagKeyList
 
 
 class LogsApi:
@@ -839,6 +923,12 @@ class LogsApi:
     @handler("CreateLogStream")
     def create_log_stream(
         self, context: RequestContext, log_group_name: LogGroupName, log_stream_name: LogStreamName
+    ) -> None:
+        raise NotImplementedError
+
+    @handler("DeleteDataProtectionPolicy")
+    def delete_data_protection_policy(
+        self, context: RequestContext, log_group_identifier: LogGroupIdentifier
     ) -> None:
         raise NotImplementedError
 
@@ -913,9 +1003,12 @@ class LogsApi:
     def describe_log_groups(
         self,
         context: RequestContext,
+        account_identifiers: AccountIds = None,
         log_group_name_prefix: LogGroupName = None,
+        log_group_name_pattern: LogGroupNamePattern = None,
         next_token: NextToken = None,
         limit: DescribeLimit = None,
+        include_linked_accounts: IncludeLinkedAccounts = None,
     ) -> DescribeLogGroupsResponse:
         raise NotImplementedError
 
@@ -924,6 +1017,7 @@ class LogsApi:
         self,
         context: RequestContext,
         log_group_name: LogGroupName,
+        log_group_identifier: LogGroupIdentifier = None,
         log_stream_name_prefix: LogStreamName = None,
         order_by: OrderBy = None,
         descending: Descending = None,
@@ -992,6 +1086,7 @@ class LogsApi:
         self,
         context: RequestContext,
         log_group_name: LogGroupName,
+        log_group_identifier: LogGroupIdentifier = None,
         log_stream_names: InputLogStreamNames = None,
         log_stream_name_prefix: LogStreamName = None,
         start_time: Timestamp = None,
@@ -1000,7 +1095,14 @@ class LogsApi:
         next_token: NextToken = None,
         limit: EventsLimit = None,
         interleaved: Interleaved = None,
+        unmask: Unmask = None,
     ) -> FilterLogEventsResponse:
+        raise NotImplementedError
+
+    @handler("GetDataProtectionPolicy")
+    def get_data_protection_policy(
+        self, context: RequestContext, log_group_identifier: LogGroupIdentifier
+    ) -> GetDataProtectionPolicyResponse:
         raise NotImplementedError
 
     @handler("GetLogEvents")
@@ -1009,23 +1111,29 @@ class LogsApi:
         context: RequestContext,
         log_group_name: LogGroupName,
         log_stream_name: LogStreamName,
+        log_group_identifier: LogGroupIdentifier = None,
         start_time: Timestamp = None,
         end_time: Timestamp = None,
         next_token: NextToken = None,
         limit: EventsLimit = None,
         start_from_head: StartFromHead = None,
+        unmask: Unmask = None,
     ) -> GetLogEventsResponse:
         raise NotImplementedError
 
     @handler("GetLogGroupFields")
     def get_log_group_fields(
-        self, context: RequestContext, log_group_name: LogGroupName, time: Timestamp = None
+        self,
+        context: RequestContext,
+        log_group_name: LogGroupName,
+        time: Timestamp = None,
+        log_group_identifier: LogGroupIdentifier = None,
     ) -> GetLogGroupFieldsResponse:
         raise NotImplementedError
 
     @handler("GetLogRecord")
     def get_log_record(
-        self, context: RequestContext, log_record_pointer: LogRecordPointer
+        self, context: RequestContext, log_record_pointer: LogRecordPointer, unmask: Unmask = None
     ) -> GetLogRecordResponse:
         raise NotImplementedError
 
@@ -1035,10 +1143,25 @@ class LogsApi:
     ) -> GetQueryResultsResponse:
         raise NotImplementedError
 
+    @handler("ListTagsForResource")
+    def list_tags_for_resource(
+        self, context: RequestContext, resource_arn: AmazonResourceName
+    ) -> ListTagsForResourceResponse:
+        raise NotImplementedError
+
     @handler("ListTagsLogGroup")
     def list_tags_log_group(
         self, context: RequestContext, log_group_name: LogGroupName
     ) -> ListTagsLogGroupResponse:
+        raise NotImplementedError
+
+    @handler("PutDataProtectionPolicy")
+    def put_data_protection_policy(
+        self,
+        context: RequestContext,
+        log_group_identifier: LogGroupIdentifier,
+        policy_document: DataProtectionPolicyDocument,
+    ) -> PutDataProtectionPolicyResponse:
         raise NotImplementedError
 
     @handler("PutDestination")
@@ -1048,6 +1171,7 @@ class LogsApi:
         destination_name: DestinationName,
         target_arn: TargetArn,
         role_arn: RoleArn,
+        tags: Tags = None,
     ) -> PutDestinationResponse:
         raise NotImplementedError
 
@@ -1131,6 +1255,7 @@ class LogsApi:
         query_string: QueryString,
         log_group_name: LogGroupName = None,
         log_group_names: LogGroupNames = None,
+        log_group_identifiers: LogGroupIdentifiers = None,
         limit: EventsLimit = None,
     ) -> StartQueryResponse:
         raise NotImplementedError
@@ -1142,6 +1267,12 @@ class LogsApi:
     @handler("TagLogGroup")
     def tag_log_group(
         self, context: RequestContext, log_group_name: LogGroupName, tags: Tags
+    ) -> None:
+        raise NotImplementedError
+
+    @handler("TagResource")
+    def tag_resource(
+        self, context: RequestContext, resource_arn: AmazonResourceName, tags: Tags
     ) -> None:
         raise NotImplementedError
 
@@ -1157,5 +1288,11 @@ class LogsApi:
     @handler("UntagLogGroup")
     def untag_log_group(
         self, context: RequestContext, log_group_name: LogGroupName, tags: TagList
+    ) -> None:
+        raise NotImplementedError
+
+    @handler("UntagResource")
+    def untag_resource(
+        self, context: RequestContext, resource_arn: AmazonResourceName, tag_keys: TagKeyList
     ) -> None:
         raise NotImplementedError

@@ -105,9 +105,17 @@ class TransformerUtility:
         """
         return [
             TransformerUtility.key_value("FunctionName"),
+            TransformerUtility.key_value(
+                "CodeSize", value_replacement="<code-size>", reference_replacement=False
+            ),
             TransformerUtility.jsonpath(
                 jsonpath="$..Code.Location",
                 value_replacement="<location>",
+                reference_replacement=False,
+            ),
+            TransformerUtility.jsonpath(
+                jsonpath="$..Content.Location",
+                value_replacement="<layer-location>",
                 reference_replacement=False,
             ),
             KeyValueBasedTransformer(_resource_name_transformer, "resource"),
@@ -282,13 +290,31 @@ class TransformerUtility:
         ]
 
     @staticmethod
+    def route53resolver_api():
+        """
+        :return: array with Transformers, for route53resolver api.
+        """
+        return [
+            TransformerUtility.key_value(
+                "SecurityGroupIds", value_replacement="sg-ids", reference_replacement=False
+            ),
+            TransformerUtility.key_value("Id"),
+            TransformerUtility.key_value("HostVPCId", "host-vpc-id"),
+            KeyValueBasedTransformer(_resource_name_transformer, "Arn"),
+            TransformerUtility.key_value("CreatorRequestId"),
+            TransformerUtility.key_value("StatusMessage", reference_replacement=False),
+        ]
+
+    @staticmethod
     def sqs_api():
         """
         :return: array with Transformers, for sqs api.
         """
         return [
             TransformerUtility.key_value("ReceiptHandle"),
-            TransformerUtility.key_value("SenderId"),
+            TransformerUtility.key_value(
+                "SenderId"
+            ),  # TODO: flaky against AWS (e.g. /Attributes/SenderId '<sender-id:1>' → '<sender-id:2>' ... (expected → actual))
             TransformerUtility.key_value("SequenceNumber"),
             TransformerUtility.jsonpath("$..MessageAttributes.RequestID.StringValue", "request-id"),
             KeyValueBasedTransformer(_resource_name_transformer, "resource"),
@@ -418,6 +444,7 @@ def _log_stream_name_transformer(key: str, val: str) -> str:
     return None
 
 
+# TODO: actual and declared type diverge
 def _resource_name_transformer(key: str, val: str) -> str:
     if isinstance(val, str):
         match = re.match(PATTERN_ARN, val)
@@ -425,6 +452,7 @@ def _resource_name_transformer(key: str, val: str) -> str:
             res = match.groups()[-1]
             if res.startswith("<") and res.endswith(">"):
                 # value was already replaced
+                # TODO: this isn't enforced or unfortunately even upheld via standard right now
                 return None
             if ":changeSet/" in val:
                 return val.split(":changeSet/")[-1]
@@ -435,6 +463,13 @@ def _resource_name_transformer(key: str, val: str) -> str:
                 if "$" in res:
                     res = res.split("$")[0].rstrip(":")
                 return res
+            if res.startswith("layer:"):
+                # extract layer name from arn
+                match res.split(":"):
+                    case _, layer_name, _:  # noqa
+                        return layer_name  # noqa
+                    case _, layer_name:  # noqa
+                        return layer_name  # noqa
             if ":" in res:
                 return res.split(":")[-1]  # TODO might not work for every replacement
             return res

@@ -6,10 +6,13 @@ import logging
 import random
 import uuid
 from concurrent.futures import Executor, Future, ThreadPoolExecutor
+from datetime import datetime
 from hashlib import sha256
+from pathlib import PurePosixPath, PureWindowsPath
 from threading import RLock
 from typing import TYPE_CHECKING, Dict, Optional
 
+from localstack import config
 from localstack.aws.api.lambda_ import (
     InvalidParameterValueException,
     InvocationType,
@@ -25,7 +28,11 @@ from localstack.services.awslambda.api_utils import (
 )
 from localstack.services.awslambda.invocation.lambda_models import (
     LAMBDA_LIMITS_CODE_SIZE_UNZIPPED_DEFAULT,
+    ArchiveCode,
+    Function,
     FunctionVersion,
+    HotReloadingCode,
+    ImageCode,
     Invocation,
     InvocationResult,
     S3Code,
@@ -36,6 +43,8 @@ from localstack.services.awslambda.invocation.models import lambda_stores
 from localstack.services.awslambda.invocation.version_manager import LambdaVersionManager
 from localstack.utils.archives import get_unzipped_size, is_zip_file
 from localstack.utils.aws import aws_stack
+from localstack.utils.container_utils.container_client import ContainerException
+from localstack.utils.docker_utils import DOCKER_CLIENT as CONTAINER_CLIENT
 from localstack.utils.strings import to_str
 
 if TYPE_CHECKING:
@@ -69,6 +78,11 @@ class LambdaService:
             shutdown_futures.append(self.task_executor.submit(version_manager.stop))
         for version_manager in self.lambda_starting_versions.values():
             shutdown_futures.append(self.task_executor.submit(version_manager.stop))
+            shutdown_futures.append(
+                self.task_executor.submit(
+                    version_manager.function_version.config.code.destroy_cached
+                )
+            )
         concurrent.futures.wait(shutdown_futures, timeout=5)
         self.task_executor.shutdown(cancel_futures=True)
 
@@ -79,8 +93,8 @@ class LambdaService:
         """
         LOG.debug("Stopping version %s", qualified_arn)
         version_manager = self.lambda_running_versions.pop(
-            qualified_arn
-        ) or self.lambda_starting_versions.pop(qualified_arn)
+            qualified_arn, self.lambda_starting_versions.pop(qualified_arn, None)
+        )
         if not version_manager:
             raise ValueError(f"Unable to find version manager for {qualified_arn}")
         self.task_executor.submit(version_manager.stop)
@@ -118,6 +132,31 @@ class LambdaService:
             self.lambda_starting_versions[qualified_arn] = version_manager
         self.task_executor.submit(version_manager.start)
 
+    def publish_version(self, function_version: FunctionVersion):
+        """
+        Synchronously create a function version (manager)
+        Should only be called on publishing new versions, which basically clone an existing one.
+        The new version needs to be added to the lambda store before invoking this.
+        After successful completion of this method, the lambda version stored will be modified to be active, with a new revision id.
+        It will then be active for execution, and should be retrieved again from the store before returning the data over the API.
+
+        :param function_version: Function Version to create
+        """
+        with self.lambda_version_manager_lock:
+            qualified_arn = function_version.id.qualified_arn()
+            version_manager = self.lambda_starting_versions.get(qualified_arn)
+            if version_manager:
+                raise Exception(
+                    "Version '%s' already starting up and in state %s",
+                    qualified_arn,
+                    version_manager.state,
+                )
+            version_manager = LambdaVersionManager(
+                function_arn=qualified_arn, function_version=function_version, lambda_service=self
+            )
+            self.lambda_starting_versions[qualified_arn] = version_manager
+        version_manager.start()
+
     # Commands
     def invoke(
         self,
@@ -151,6 +190,12 @@ class LambdaService:
         qualifier = qualifier or "$LATEST"
         state = lambda_stores[account_id][region]
         function = state.functions.get(function_name)
+
+        if function is None:
+            raise ResourceNotFoundException(
+                f"Function not found: {invoked_arn}", Type="User"
+            )  # TODO: test
+
         if qualifier_is_alias(qualifier):
             alias = function.aliases.get(qualifier)
             if not alias:
@@ -189,6 +234,7 @@ class LambdaService:
                 invoked_arn=invoked_arn,
                 client_context=client_context,
                 invocation_type=invocation_type,
+                invoke_time=datetime.now(),
             )
         )
 
@@ -222,6 +268,7 @@ class LambdaService:
         :param new_state: New state
         """
         function_arn = function_version.qualified_arn
+        old_version = None
         with self.lambda_version_manager_lock:
             new_version = self.lambda_starting_versions.pop(function_arn)
             if not new_version:
@@ -231,9 +278,6 @@ class LambdaService:
             if new_state.state == State.Active:
                 old_version = self.lambda_running_versions.get(function_arn, None)
                 self.lambda_running_versions[function_arn] = new_version
-                if old_version:
-                    # if there is an old version, we assume it is an update, and stop the old one
-                    self.task_executor.submit(old_version.stop)
                 update_status = UpdateStatus(status=LastUpdateStatus.Successful)
             elif new_state.state == State.Failed:
                 update_status = UpdateStatus(status=LastUpdateStatus.Failed)
@@ -250,9 +294,8 @@ class LambdaService:
 
         # TODO is it necessary to get the version again? Should be locked for modification anyway
         state = lambda_stores[function_version.id.account][function_version.id.region]
-        current_version = state.functions[function_version.id.function_name].versions[
-            function_version.id.qualifier
-        ]
+        function = state.functions[function_version.id.function_name]
+        current_version = function.versions[function_version.id.qualifier]
         new_version = dataclasses.replace(
             current_version,
             config=dataclasses.replace(
@@ -262,6 +305,38 @@ class LambdaService:
         state.functions[function_version.id.function_name].versions[
             function_version.id.qualifier
         ] = new_version
+
+        if old_version:
+            # if there is an old version, we assume it is an update, and stop the old one
+            self.task_executor.submit(old_version.stop)
+            self.task_executor.submit(
+                destroy_code_if_not_used, old_version.function_version.config.code, function
+            )
+
+
+def is_code_used(code: S3Code, function: Function) -> bool:
+    """
+    Check if given code is still used in some version of the function
+
+    :param code: Code object
+    :param function: function to check
+    :return: bool whether code is used in another version of the function
+    """
+    with function.lock:
+        return any(code == version.config.code for version in function.versions.values())
+
+
+def destroy_code_if_not_used(code: S3Code, function: Function) -> None:
+    """
+    Destroy the given code if it is not used in some version of the function
+    Do nothing otherwise
+
+    :param code: Code object
+    :param function: Function the code belongs too
+    """
+    with function.lock:
+        if not is_code_used(code, function):
+            code.destroy()
 
 
 def store_lambda_archive(
@@ -295,16 +370,27 @@ def store_lambda_archive(
     bucket_name = f"awslambda-{region_name}-tasks"
     # s3 create bucket is idempotent
     s3_client.create_bucket(Bucket=bucket_name)
-    key = f"snapshots/{account_id}/{function_name}-{uuid.uuid4()}"
+    code_id = f"{function_name}-{uuid.uuid4()}"
+    key = f"snapshots/{account_id}/{code_id}"
     s3_client.upload_fileobj(Fileobj=io.BytesIO(archive_file), Bucket=bucket_name, Key=key)
     code_sha256 = to_str(base64.b64encode(sha256(archive_file).digest()))
     return S3Code(
+        id=code_id,
         s3_bucket=bucket_name,
         s3_key=key,
         s3_object_version=None,
         code_sha256=code_sha256,
         code_size=len(archive_file),
     )
+
+
+def create_hot_reloading_code(path: str) -> HotReloadingCode:
+    # TODO extract into other function
+    if not PurePosixPath(path).is_absolute() and not PureWindowsPath(path).is_absolute():
+        raise InvalidParameterValueException(
+            f"When using hot reloading, the archive key has to be an absolute path! Your archive key: {path}",
+        )
+    return HotReloadingCode(host_path=path)
 
 
 def store_s3_bucket_archive(
@@ -314,7 +400,7 @@ def store_s3_bucket_archive(
     function_name: str,
     region_name: str,
     account_id: str,
-) -> S3Code:
+) -> ArchiveCode:
     """
     Takes the lambda archive stored in the given bucket and stores it in an internal s3 bucket
 
@@ -326,6 +412,8 @@ def store_s3_bucket_archive(
     :param account_id: account id the archive should be stored for
     :return: S3 Code object representing the archive stored in S3
     """
+    if archive_bucket == config.BUCKET_MARKER_LOCAL:
+        return create_hot_reloading_code(path=archive_key)
     s3_client: "S3Client" = aws_stack.connect_to_service("s3")
     kwargs = {"VersionId": archive_version} if archive_version else {}
     archive_file = s3_client.get_object(Bucket=archive_bucket, Key=archive_key, **kwargs)[
@@ -334,3 +422,26 @@ def store_s3_bucket_archive(
     return store_lambda_archive(
         archive_file, function_name=function_name, region_name=region_name, account_id=account_id
     )
+
+
+def create_image_code(image_uri: str) -> ImageCode:
+    """
+    Creates an image code by inspecting the provided image
+
+    :param image_uri: Image URI of the image to inspect
+    :return: Image code object
+    """
+    code_sha256 = "<cannot-find-image>"
+    try:
+        CONTAINER_CLIENT.pull_image(docker_image=image_uri)
+    except ContainerException:
+        LOG.debug("Cannot pull image %s. Maybe only available locally?", image_uri)
+    try:
+        code_sha256 = CONTAINER_CLIENT.inspect_image(image_name=image_uri)["RepoDigests"][
+            0
+        ].rpartition(":")[2]
+    except Exception as e:
+        LOG.debug(
+            "Cannot inspect image %s. Is this image and/or docker available: %s", image_uri, e
+        )
+    return ImageCode(image_uri=image_uri, code_sha256=code_sha256, repository_type="ECR")
