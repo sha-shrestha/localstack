@@ -261,6 +261,10 @@ def load_environment(profile: str = None):
     dotenv.load_dotenv(path, override=False)
 
 
+def is_persistence_enabled() -> bool:
+    return PERSISTENCE and dirs.data
+
+
 def is_linux():
     return platform.system() == "Linux"
 
@@ -268,7 +272,7 @@ def is_linux():
 def ping(host):
     """Returns True if host responds to a ping request"""
     is_windows = platform.system().lower() == "windows"
-    ping_opts = "-n 1" if is_windows else "-c 1"
+    ping_opts = "-n 1 -w 2000" if is_windows else "-c 1 -W 2"
     args = "ping %s %s" % (ping_opts, host)
     return (
         subprocess.call(args, shell=not is_windows, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -397,7 +401,12 @@ LEGACY_EDGE_PROXY = is_env_true("LEGACY_EDGE_PROXY")
 
 # whether legacy s3 is enabled
 # TODO change when asf becomes default: os.environ.get("PROVIDER_OVERRIDE_S3", "") == 'legacy'
-LEGACY_S3_PROVIDER = os.environ.get("PROVIDER_OVERRIDE_S3", "") not in ("asf", "asf_pro")
+LEGACY_S3_PROVIDER = os.environ.get("PROVIDER_OVERRIDE_S3", "") not in (
+    "asf",
+    "asf_pro",
+    "v2",
+    "v2_pro",
+)
 
 # Whether to report internal failures as 500 or 501 errors.
 FAIL_FAST = is_env_true("FAIL_FAST")
@@ -649,6 +658,11 @@ LAMBDA_REMOVE_CONTAINERS = (
     os.environ.get("LAMBDA_REMOVE_CONTAINERS", "").lower().strip() not in FALSE_STRINGS
 )
 
+# time in milliseconds until lambda kills the execution environment after the last invocation has been processed
+# can be set to 0 to immediately kill the execution environments after an invocation
+# defaults to 600_000 ms => 10 minutes
+LAMBDA_KEEPALIVE_MS = int(os.environ.get("LAMBDA_KEEPALIVE_MS", "600000"))
+
 # DEV | Only for LS developers. Only applicable to new Lambda provider.
 # whether to explicitly expose port in lambda container when invoking functions in host mode for systems that cannot
 # reach the container via its IPv4 (e.g., macOS https://docs.docker.com/desktop/networking/#i-cannot-ping-my-containers)
@@ -664,6 +678,8 @@ WINDOWS_DOCKER_MOUNT_PREFIX = os.environ.get("WINDOWS_DOCKER_MOUNT_PREFIX", "/ho
 
 # whether to skip S3 presign URL signature validation (TODO: currently enabled, until all issues are resolved)
 S3_SKIP_SIGNATURE_VALIDATION = is_env_not_false("S3_SKIP_SIGNATURE_VALIDATION")
+# whether to skip S3 validation of provided KMS key
+S3_SKIP_KMS_KEY_VALIDATION = is_env_not_false("S3_SKIP_KMS_KEY_VALIDATION")
 
 # user-defined lambda executor mode
 LAMBDA_EXECUTOR = os.environ.get("LAMBDA_EXECUTOR", "").strip()
@@ -695,6 +711,10 @@ LAMBDA_TRUNCATE_STDOUT = int(os.getenv("LAMBDA_TRUNCATE_STDOUT") or 2000)
 #   The delay between the first retry and the second retry will be 60s
 LAMBDA_RETRY_BASE_DELAY_SECONDS = int(os.getenv("LAMBDA_RETRY_BASE_DELAY") or 60)
 
+# whether Lambda.CreateFunction will block until the function is in a terminal state (active or failed)
+# this technically breaks behavior parity but is provided as a simplification over the default AWS behavior
+LAMBDA_SYNCHRONOUS_CREATE = is_env_true("LAMBDA_SYNCHRONOUS_CREATE")
+
 # A comma-delimited string of stream names and its corresponding shard count to
 # initialize during startup (DEPRECATED).
 # For example: "my-first-stream:1,my-other-stream:2,my-last-stream:1"
@@ -725,12 +745,11 @@ OPENSEARCH_MULTI_CLUSTER = is_env_not_false("OPENSEARCH_MULTI_CLUSTER") or is_en
     "ES_MULTI_CLUSTER"
 )
 
+# Whether to really publish to GCM while using SNS Platform Application (needs credentials)
+LEGACY_SNS_GCM_PUBLISHING = is_env_true("LEGACY_SNS_GCM_PUBLISHING")
+
 # TODO remove fallback to LAMBDA_DOCKER_NETWORK with next minor version
 MAIN_DOCKER_NETWORK = os.environ.get("MAIN_DOCKER_NETWORK", "") or LAMBDA_DOCKER_NETWORK
-
-# EXPERIMENTAL/LEGACY. Use this flag to return to the legacy behavior of resolving references in the specific models
-CFN_ENABLE_RESOLVE_REFS_IN_MODELS = is_env_true("CFN_ENABLE_RESOLVE_REFS_IN_MODELS")
-
 
 # list of environment variable names used for configuration.
 # Make sure to keep this in sync with the above!
@@ -792,9 +811,11 @@ CONFIG_ENV_VARS = [
     "LAMBDA_STAY_OPEN_MODE",
     "LAMBDA_TRUNCATE_STDOUT",
     "LAMBDA_RETRY_BASE_DELAY_SECONDS",
+    "LAMBDA_SYNCHRONOUS_CREATE",
     "LEGACY_DIRECTORIES",
     "LEGACY_DOCKER_CLIENT",
     "LEGACY_EDGE_PROXY",
+    "LEGACY_SNS_GCM_PUBLISHING",
     "LOCALSTACK_API_KEY",
     "LOCALSTACK_HOSTNAME",
     "LOG_LICENSE_ISSUES",
@@ -806,6 +827,7 @@ CONFIG_ENV_VARS = [
     "PERSISTENCE",
     "REQUESTS_CA_BUNDLE",
     "S3_SKIP_SIGNATURE_VALIDATION",
+    "S3_SKIP_KMS_KEY_VALIDATION",
     "SERVICES",
     "SKIP_INFRA_DOWNLOADS",
     "SKIP_SSL_CERT_DOWNLOAD",

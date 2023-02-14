@@ -165,6 +165,8 @@ class LambdaVersionManager(ServiceEndpoint):
             self.log_handler.start_subscriber()
             get_runtime_executor().prepare_version(self.function_version)
 
+            # code and reason not set for success scenario because only failed states provide this field:
+            # https://docs.aws.amazon.com/lambda/latest/dg/API_GetFunctionConfiguration.html#SSS-GetFunctionConfiguration-response-LastUpdateStatusReasonCode
             self.state = VersionState(state=State.Active)
             LOG.debug(
                 f"Lambda '{self.function_arn}' (id {self.function_version.config.internal_revision}) changed to active"
@@ -263,6 +265,7 @@ class LambdaVersionManager(ServiceEndpoint):
                 if self.available_environments.empty() or self.active_environment_count() == 0:
                     self.start_environment()
                 environment = None
+                # TODO avoid infinite environment spawning retrying
                 while not environment:
                     try:
                         environment = self.available_environments.get(timeout=1)
@@ -280,6 +283,9 @@ class LambdaVersionManager(ServiceEndpoint):
                         environment.invoke(invocation_event=queued_invocation)
                         LOG.debug("Invoke for request %s done", queued_invocation.invocation_id)
                     except queue.Empty:
+                        # TODO if one environment threw an invalid status exception, we will get here potentially with
+                        # another busy environment, and won't spawn a new one as there is one active here.
+                        # We will be stuck in the loop until another becomes active without scaling.
                         if self.active_environment_count() == 0:
                             LOG.debug(
                                 "Detected no active environments for version %s. Starting one...",
@@ -293,6 +299,8 @@ class LambdaVersionManager(ServiceEndpoint):
                             environment.id,
                         )
                         self.running_invocations.pop(queued_invocation.invocation_id, None)
+                        # try next environment
+                        environment = None
             except Exception as e:
                 queued_invocation.result_future.set_exception(e)
 

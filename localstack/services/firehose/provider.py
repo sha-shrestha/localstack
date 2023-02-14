@@ -15,6 +15,8 @@ import requests
 from localstack.aws.accounts import get_aws_account_id
 from localstack.aws.api import RequestContext
 from localstack.aws.api.firehose import (
+    AmazonOpenSearchServerlessDestinationConfiguration,
+    AmazonOpenSearchServerlessDestinationUpdate,
     AmazonopensearchserviceDestinationConfiguration,
     AmazonopensearchserviceDestinationUpdate,
     BooleanObject,
@@ -57,6 +59,7 @@ from localstack.aws.api.firehose import (
     S3DestinationConfiguration,
     S3DestinationDescription,
     S3DestinationUpdate,
+    ServiceUnavailableException,
     SplunkDestinationConfiguration,
     SplunkDestinationUpdate,
     TagDeliveryStreamInputTagList,
@@ -80,8 +83,14 @@ from localstack.services.firehose.mappers import (
     convert_source_config_to_desc,
 )
 from localstack.services.firehose.models import FirehoseStore, firehose_stores
+from localstack.services.opensearch import versions
 from localstack.utils.aws import aws_stack
-from localstack.utils.aws.arns import extract_region_from_arn, firehose_stream_arn, s3_bucket_name
+from localstack.utils.aws.arns import (
+    extract_region_from_arn,
+    firehose_stream_arn,
+    opensearch_domain_name,
+    s3_bucket_name,
+)
 from localstack.utils.common import (
     TIMESTAMP_FORMAT_MICROS,
     first_char_to_lower,
@@ -94,6 +103,7 @@ from localstack.utils.common import (
     truncate,
 )
 from localstack.utils.kinesis import kinesis_connector
+from localstack.utils.kinesis.kinesis_connector import KinesisProcessorThread
 from localstack.utils.run import run_for_max_seconds
 
 LOG = logging.getLogger(__name__)
@@ -136,7 +146,7 @@ def get_opensearch_endpoint(domain_arn: str) -> str:
     opensearch_client = aws_stack.connect_to_service(
         service_name="opensearch", region_name=region_name
     )
-    domain_name = domain_arn.rpartition("/")[2]
+    domain_name = opensearch_domain_name(domain_arn)
     info = opensearch_client.describe_domain(DomainName=domain_name)
     base_domain = info["DomainStatus"]["Endpoint"]
     # Add the URL scheme "http" if it's not set yet. https might not be enabled for all instances
@@ -182,6 +192,13 @@ def get_search_db_connection(endpoint: str, region_name: str):
 
 
 class FirehoseProvider(FirehoseApi):
+    # maps a delivery_stream_arn to its kinesis thread; the arn encodes account id and region
+    kinesis_listeners: dict[str, KinesisProcessorThread]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.kinesis_listeners = {}
+
     @staticmethod
     def get_store() -> FirehoseStore:
         return firehose_stores[get_aws_account_id()][aws_stack.get_region()]
@@ -201,6 +218,7 @@ class FirehoseProvider(FirehoseApi):
         splunk_destination_configuration: SplunkDestinationConfiguration = None,
         http_endpoint_destination_configuration: HttpEndpointDestinationConfiguration = None,
         tags: TagDeliveryStreamInputTagList = None,
+        amazon_open_search_serverless_destination_configuration: AmazonOpenSearchServerlessDestinationConfiguration = None,
     ) -> CreateDeliveryStreamOutput:
         store = self.get_store()
 
@@ -215,12 +233,28 @@ class FirehoseProvider(FirehoseApi):
                 )
             )
         if amazonopensearchservice_destination_configuration:
+            db_description = convert_opensearch_config_to_desc(
+                amazonopensearchservice_destination_configuration
+            )
+
+            domain_arn = db_description.get("DomainARN")
+            domain_name = opensearch_domain_name(domain_arn)
+
+            domain = aws_stack.connect_to_service("opensearch").describe_domain(
+                DomainName=domain_name
+            )
+            engine_version = domain["DomainStatus"]["EngineVersion"]
+
+            if versions.get_install_version(engine_version).startswith("2.3"):
+                # See https://docs.aws.amazon.com/opensearch-service/latest/developerguide/version-migration.html
+                raise ServiceUnavailableException(
+                    "Delivery stream destination is not supported: OpenSearch 2.3"
+                )
+
             destinations.append(
                 DestinationDescription(
                     DestinationId=short_uid(),
-                    AmazonopensearchserviceDestinationDescription=convert_opensearch_config_to_desc(
-                        amazonopensearchservice_destination_configuration
-                    ),
+                    AmazonopensearchserviceDestinationDescription=db_description,
                 )
             )
         if s3_destination_configuration or extended_s3_destination_configuration:
@@ -252,6 +286,10 @@ class FirehoseProvider(FirehoseApi):
             LOG.warning(
                 "Delivery stream contains a redshift destination (which is currently not supported)."
             )
+        if amazon_open_search_serverless_destination_configuration:
+            LOG.warning(
+                "Delivery stream contains a opensearch serverless destination (which is currently not supported)."
+            )
 
         stream = DeliveryStreamDescription(
             DeliveryStreamName=delivery_stream_name,
@@ -268,7 +306,8 @@ class FirehoseProvider(FirehoseApi):
             Destinations=destinations,
             Source=convert_source_config_to_desc(kinesis_stream_source_configuration),
         )
-        store.TAGS.tag_resource(stream["DeliveryStreamARN"], tags)
+        delivery_stream_arn = stream["DeliveryStreamARN"]
+        store.TAGS.tag_resource(delivery_stream_arn, tags)
         store.delivery_streams[delivery_stream_name] = stream
 
         if delivery_stream_type == DeliveryStreamType.KinesisStreamAsSource:
@@ -287,7 +326,8 @@ class FirehoseProvider(FirehoseApi):
                         wait_until_started=True,
                         ddb_lease_table_suffix="-firehose",
                     )
-                    store.kinesis_listeners[delivery_stream_name] = process
+
+                    self.kinesis_listeners[delivery_stream_arn] = process
                     stream["DeliveryStreamStatus"] = DeliveryStreamStatus.ACTIVE
                 except Exception as e:
                     LOG.warning(
@@ -310,8 +350,13 @@ class FirehoseProvider(FirehoseApi):
             raise ResourceNotFoundException(
                 f"Firehose {delivery_stream_name} under account {context.account_id} " f"not found."
             )
-        kinesis_process = store.kinesis_listeners.pop(delivery_stream_name, None)
-        if kinesis_process:
+
+        delivery_stream_arn = firehose_stream_arn(
+            stream_name=delivery_stream_name,
+            account_id=context.account_id,
+            region_name=context.region,
+        )
+        if kinesis_process := self.kinesis_listeners.pop(delivery_stream_arn, None):
             LOG.debug("Stopping kinesis listener for %s", delivery_stream_name)
             kinesis_process.stop()
 
@@ -425,6 +470,7 @@ class FirehoseProvider(FirehoseApi):
         amazonopensearchservice_destination_update: AmazonopensearchserviceDestinationUpdate = None,
         splunk_destination_update: SplunkDestinationUpdate = None,
         http_endpoint_destination_update: HttpEndpointDestinationUpdate = None,
+        amazon_open_search_serverless_destination_update: AmazonOpenSearchServerlessDestinationUpdate = None,
     ) -> UpdateDestinationOutput:
         delivery_stream_description = _get_description_or_raise_not_found(
             context, delivery_stream_name
@@ -566,7 +612,6 @@ class FirehoseProvider(FirehoseApi):
         sends Firehose records to an ElasticSearch or Opensearch database
         """
         search_db_index = db_description["IndexName"]
-        search_db_type = db_description.get("TypeName")
         region = aws_stack.get_region()
         domain_arn = db_description.get("DomainARN")
         cluster_endpoint = db_description.get("ClusterEndpoint")
@@ -574,6 +619,7 @@ class FirehoseProvider(FirehoseApi):
             cluster_endpoint = get_opensearch_endpoint(domain_arn)
 
         db_connection = get_search_db_connection(cluster_endpoint, region)
+
         if db_description.get("S3BackupMode") == ElasticsearchS3BackupMode.AllDocuments:
             s3_dest_desc = db_description.get("S3DestinationDescription")
             if s3_dest_desc:
@@ -613,9 +659,7 @@ class FirehoseProvider(FirehoseApi):
                 )
             )
             try:
-                db_connection.create(
-                    index=search_db_index, doc_type=search_db_type, id=obj_id, body=body
-                )
+                db_connection.create(index=search_db_index, id=obj_id, body=body)
             except Exception as e:
                 LOG.exception(f"Unable to put record to stream {delivery_stream_name}.")
                 raise e

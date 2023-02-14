@@ -101,6 +101,11 @@ class AutoTuneType(str):
     SCHEDULED_ACTION = "SCHEDULED_ACTION"
 
 
+class ConnectionMode(str):
+    DIRECT = "DIRECT"
+    VPC_ENDPOINT = "VPC_ENDPOINT"
+
+
 class DeploymentStatus(str):
     PENDING_UPDATE = "PENDING_UPDATE"
     IN_PROGRESS = "IN_PROGRESS"
@@ -121,6 +126,11 @@ class DomainPackageStatus(str):
     ACTIVE = "ACTIVE"
     DISSOCIATING = "DISSOCIATING"
     DISSOCIATION_FAILED = "DISSOCIATION_FAILED"
+
+
+class DryRunMode(str):
+    Basic = "Basic"
+    Verbose = "Verbose"
 
 
 class EngineType(str):
@@ -452,6 +462,7 @@ class InboundConnection(TypedDict, total=False):
     RemoteDomainInfo: Optional[DomainInformationContainer]
     ConnectionId: Optional[ConnectionId]
     ConnectionStatus: Optional[InboundConnectionStatus]
+    ConnectionMode: Optional[ConnectionMode]
 
 
 class AcceptInboundConnectionResponse(TypedDict, total=False):
@@ -769,6 +780,10 @@ class CompatibleVersionsMap(TypedDict, total=False):
 CompatibleVersionsList = List[CompatibleVersionsMap]
 
 
+class ConnectionProperties(TypedDict, total=False):
+    Endpoint: Optional[Endpoint]
+
+
 class DomainEndpointOptions(TypedDict, total=False):
     EnforceHTTPS: Optional[Boolean]
     TLSSecurityPolicy: Optional[TLSSecurityPolicy]
@@ -876,6 +891,7 @@ class CreateOutboundConnectionRequest(ServiceRequest):
     LocalDomainInfo: DomainInformationContainer
     RemoteDomainInfo: DomainInformationContainer
     ConnectionAlias: ConnectionAlias
+    ConnectionMode: Optional[ConnectionMode]
 
 
 class OutboundConnectionStatus(TypedDict, total=False):
@@ -889,6 +905,8 @@ class CreateOutboundConnectionResponse(TypedDict, total=False):
     ConnectionAlias: Optional[ConnectionAlias]
     ConnectionStatus: Optional[OutboundConnectionStatus]
     ConnectionId: Optional[ConnectionId]
+    ConnectionMode: Optional[ConnectionMode]
+    ConnectionProperties: Optional[ConnectionProperties]
 
 
 class PackageSource(TypedDict, total=False):
@@ -967,6 +985,8 @@ class OutboundConnection(TypedDict, total=False):
     ConnectionId: Optional[ConnectionId]
     ConnectionAlias: Optional[ConnectionAlias]
     ConnectionStatus: Optional[OutboundConnectionStatus]
+    ConnectionMode: Optional[ConnectionMode]
+    ConnectionProperties: Optional[ConnectionProperties]
 
 
 class DeleteOutboundConnectionResponse(TypedDict, total=False):
@@ -1102,6 +1122,39 @@ DomainStatusList = List[DomainStatus]
 
 class DescribeDomainsResponse(TypedDict, total=False):
     DomainStatusList: DomainStatusList
+
+
+class DescribeDryRunProgressRequest(ServiceRequest):
+    DomainName: DomainName
+    DryRunId: Optional[GUID]
+    LoadDryRunConfig: Optional[Boolean]
+
+
+class DryRunResults(TypedDict, total=False):
+    DeploymentType: Optional[DeploymentType]
+    Message: Optional[Message]
+
+
+class ValidationFailure(TypedDict, total=False):
+    Code: Optional[String]
+    Message: Optional[String]
+
+
+ValidationFailures = List[ValidationFailure]
+
+
+class DryRunProgressStatus(TypedDict, total=False):
+    DryRunId: GUID
+    DryRunStatus: String
+    CreationDate: String
+    UpdateDate: String
+    ValidationFailures: Optional[ValidationFailures]
+
+
+class DescribeDryRunProgressResponse(TypedDict, total=False):
+    DryRunProgressStatus: Optional[DryRunProgressStatus]
+    DryRunConfig: Optional[DomainStatus]
+    DryRunResults: Optional[DryRunResults]
 
 
 ValueStringList = List[NonEmptyString]
@@ -1318,11 +1371,6 @@ class DomainInfo(TypedDict, total=False):
 
 DomainInfoList = List[DomainInfo]
 DomainPackageDetailsList = List[DomainPackageDetails]
-
-
-class DryRunResults(TypedDict, total=False):
-    DeploymentType: Optional[DeploymentType]
-    Message: Optional[Message]
 
 
 class GetCompatibleVersionsRequest(ServiceRequest):
@@ -1564,11 +1612,13 @@ class UpdateDomainConfigRequest(ServiceRequest):
     AdvancedSecurityOptions: Optional[AdvancedSecurityOptionsInput]
     AutoTuneOptions: Optional[AutoTuneOptions]
     DryRun: Optional[DryRun]
+    DryRunMode: Optional[DryRunMode]
 
 
 class UpdateDomainConfigResponse(TypedDict, total=False):
     DomainConfig: DomainConfig
     DryRunResults: Optional[DryRunResults]
+    DryRunProgressStatus: Optional[DryRunProgressStatus]
 
 
 class UpdatePackageRequest(ServiceRequest):
@@ -1670,6 +1720,7 @@ class OpensearchApi:
         local_domain_info: DomainInformationContainer,
         remote_domain_info: DomainInformationContainer,
         connection_alias: ConnectionAlias,
+        connection_mode: ConnectionMode = None,
     ) -> CreateOutboundConnectionResponse:
         raise NotImplementedError
 
@@ -1756,6 +1807,16 @@ class OpensearchApi:
     def describe_domains(
         self, context: RequestContext, domain_names: DomainNameList
     ) -> DescribeDomainsResponse:
+        raise NotImplementedError
+
+    @handler("DescribeDryRunProgress")
+    def describe_dry_run_progress(
+        self,
+        context: RequestContext,
+        domain_name: DomainName,
+        dry_run_id: GUID = None,
+        load_dry_run_config: Boolean = None,
+    ) -> DescribeDryRunProgressResponse:
         raise NotImplementedError
 
     @handler("DescribeInboundConnections")
@@ -1978,6 +2039,7 @@ class OpensearchApi:
         advanced_security_options: AdvancedSecurityOptionsInput = None,
         auto_tune_options: AutoTuneOptions = None,
         dry_run: DryRun = None,
+        dry_run_mode: DryRunMode = None,
     ) -> UpdateDomainConfigResponse:
         raise NotImplementedError
 

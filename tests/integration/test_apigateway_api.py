@@ -1,4 +1,5 @@
 import json
+import logging
 
 import pytest
 import requests
@@ -10,130 +11,7 @@ from localstack.utils.files import load_file
 from localstack.utils.strings import short_uid
 from tests.integration.test_apigateway import TEST_IMPORT_PETSTORE_SWAGGER
 
-
-def test_create_and_get_rest_api(apigateway_client):
-    response = apigateway_client.create_rest_api(name="my_api", description="this is my api")
-    api_id = response["id"]
-
-    response = apigateway_client.get_rest_api(restApiId=api_id)
-
-    response.pop("ResponseMetadata")
-    response.pop("createdDate")
-
-    assert response == {
-        "id": api_id,
-        "name": "my_api",
-        "description": "this is my api",
-        "version": "V1",
-        "binaryMediaTypes": [],
-        "apiKeySource": "HEADER",
-        "endpointConfiguration": {"types": ["EDGE"]},
-        "tags": {},
-        "disableExecuteApiEndpoint": False,
-    }
-
-
-def test_update_rest_api(apigateway_client):
-    response = apigateway_client.create_rest_api(name="my_api", description="this is my api")
-    api_id = response["id"]
-    patchOperations = [
-        {"op": "replace", "path": "/name", "value": "new-name"},
-        {"op": "replace", "path": "/description", "value": "new-description"},
-        {"op": "replace", "path": "/apiKeySource", "value": "AUTHORIZER"},
-        {"op": "replace", "path": "/binaryMediaTypes", "value": "image/jpeg"},
-        {"op": "replace", "path": "/disableExecuteApiEndpoint", "value": "True"},
-    ]
-
-    response = apigateway_client.update_rest_api(restApiId=api_id, patchOperations=patchOperations)
-    response.pop("ResponseMetadata")
-    response.pop("createdDate")
-    response.pop("binaryMediaTypes")
-    assert response == {
-        "id": api_id,
-        "name": "new-name",
-        "version": "V1",
-        "description": "new-description",
-        "apiKeySource": "AUTHORIZER",
-        "endpointConfiguration": {"types": ["EDGE"]},
-        "tags": {},
-        "disableExecuteApiEndpoint": True,
-        "minimumCompressionSize": -1,
-    }
-
-    # should fail with wrong apikeysoruce - TODO enable!
-    # patchOperations = [
-    #     {"op": "replace", "path": "/apiKeySource", "value": "Wrong-value-AUTHORIZER"}
-    # ]
-    # with pytest.raises(ClientError) as ex:
-    #     apigateway_client.update_rest_api(
-    #         restApiId=api_id, patchOperations=patchOperations
-    #     )
-    #
-    # assert ex.value.response["Error"]["Message"] == (
-    #     "1 validation error detected: Value 'Wrong-value-AUTHORIZER' at "
-    #     "'createRestApiInput.apiKeySource' failed to satisfy constraint: Member must satisfy enum "
-    #     "value set: [AUTHORIZER, HEADER]"
-    # )
-    # assert ex.value.response["Error"]["Code"] == "ValidationException"
-
-
-def test_update_rest_api_invalid_api_id(apigateway_client):
-    patchOperations = [{"op": "replace", "path": "/apiKeySource", "value": "AUTHORIZER"}]
-    with pytest.raises(ClientError) as ex:
-        apigateway_client.update_rest_api(restApiId="api_id", patchOperations=patchOperations)
-    assert ex.value.response["Error"]["Code"] == "NotFoundException"
-
-
-# TODO enable/fix test!
-@pytest.mark.skip
-def test_update_rest_api_operation_add_remove(apigateway_client):
-    response = apigateway_client.create_rest_api(name="my_api", description="this is my api")
-    api_id = response["id"]
-    patchOperations = [
-        {"op": "add", "path": "/binaryMediaTypes", "value": "image/png"},
-        {"op": "add", "path": "/binaryMediaTypes", "value": "image/jpeg"},
-    ]
-    response = apigateway_client.update_rest_api(restApiId=api_id, patchOperations=patchOperations)
-    assert response["binaryMediaTypes"] == ["image/png", "image/jpeg"]
-    assert response["description"] == "this is my api"
-    patchOperations = [
-        {"op": "remove", "path": "/binaryMediaTypes", "value": "image/png"},
-        {"op": "remove", "path": "/description"},
-    ]
-    response = apigateway_client.update_rest_api(restApiId=api_id, patchOperations=patchOperations)
-    assert response["binaryMediaTypes"] == ["image/jpeg"]
-    assert response["description"] == ""
-
-
-def test_list_and_delete_apis(apigateway_client):
-    api_name1 = short_uid()
-    api_name2 = short_uid()
-
-    response = apigateway_client.create_rest_api(name=api_name1, description="this is my api")
-    api_id = response["id"]
-    apigateway_client.create_rest_api(name=api_name2, description="this is my api2")
-
-    response = apigateway_client.get_rest_apis()
-    items = [item for item in response["items"] if item["name"] in [api_name1, api_name2]]
-    assert len(items) == (2)
-
-    apigateway_client.delete_rest_api(restApiId=api_id)
-
-    response = apigateway_client.get_rest_apis()
-    items = [item for item in response["items"] if item["name"] in [api_name1, api_name2]]
-    assert len(items) == 1
-
-
-def test_create_rest_api_with_tags(apigateway_client):
-    response = apigateway_client.create_rest_api(
-        name="my_api", description="this is my api", tags={"MY_TAG1": "MY_VALUE1"}
-    )
-    api_id = response["id"]
-
-    response = apigateway_client.get_rest_api(restApiId=api_id)
-
-    assert "tags" in response
-    assert response["tags"] == {"MY_TAG1": "MY_VALUE1"}
+LOG = logging.getLogger(__name__)
 
 
 @pytest.mark.skip

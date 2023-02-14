@@ -1,7 +1,6 @@
 import logging
 from typing import Optional, TypedDict
 
-from localstack import config
 from localstack.utils.aws import aws_stack
 
 LOG = logging.getLogger(__name__)
@@ -69,9 +68,10 @@ class GenericBaseModel:
     # TODO: change the signature to pass in a Stack instance (instead of stack_name and resources)
     def update_resource(self, new_resource, stack_name, resources):
         """Update the deployment of this resource, using the updated properties (implemented by subclasses)."""
-        # TODO: evaluate if we can add a generic implementation here, using "update" parameters from
-        # get_deploy_templates() responses, and based on checking whether resource attributes have changed
-        pass
+        raise NotImplementedError
+
+    def is_updatable(self) -> bool:
+        return type(self).update_resource != GenericBaseModel.update_resource
 
     @classmethod
     def cloudformation_type(cls):
@@ -157,17 +157,3 @@ class GenericBaseModel:
     def resource_id(self) -> str:
         """Return the logical resource ID of this resource (i.e., the ref. name within the stack's resources)."""
         return self.resource_json["LogicalResourceId"]
-
-    @classmethod
-    def resolve_refs_recursively(cls, stack_name, value, resources):
-        if config.CFN_ENABLE_RESOLVE_REFS_IN_MODELS:
-            # TODO: restructure code to avoid circular import here
-            from localstack.services.cloudformation.engine.template_deployer import (
-                resolve_refs_recursively,
-            )
-            from localstack.services.cloudformation.provider import find_stack
-
-            stack = find_stack(stack_name)
-            return resolve_refs_recursively(stack, value)
-
-        return value

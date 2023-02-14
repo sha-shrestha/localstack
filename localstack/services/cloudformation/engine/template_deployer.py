@@ -16,7 +16,11 @@ from localstack.services.cloudformation.deployment_utils import (
     is_none_or_empty_value,
     remove_none_values,
 )
-from localstack.services.cloudformation.engine.entities import Stack, StackChangeSet
+from localstack.services.cloudformation.engine.entities import (
+    Stack,
+    StackChangeSet,
+    resolve_ssm_parameter_value,
+)
 from localstack.services.cloudformation.service_models import (
     KEY_RESOURCE_STATE,
     DependencyNotYetSatisfied,
@@ -43,20 +47,6 @@ REGEX_OUTPUT_APIGATEWAY = re.compile(
 REGEX_DYNAMIC_REF = re.compile("{{resolve:([^:]+):(.+)}}")
 
 LOG = logging.getLogger(__name__)
-
-# list of resource types that can be updated
-# TODO: make this a property of the model classes themselves
-UPDATEABLE_RESOURCES = [
-    "AWS::CDK::Metadata",
-    "AWS::Lambda::Function",
-    "AWS::Lambda::Permission",
-    "AWS::ApiGateway::Method",
-    "AWS::ApiGateway::UsagePlan",
-    "AWS::SSM::Parameter",
-    "AWS::StepFunctions::StateMachine",
-    "AWS::IAM::Role",
-    "AWS::EC2::Instance",
-]
 
 # list of static attribute references to be replaced in {'Fn::Sub': '...'} strings
 STATIC_REFS = ["AWS::Region", "AWS::Partition", "AWS::StackName", "AWS::AccountId"]
@@ -184,7 +174,7 @@ def check_not_found_exception(e, resource_type, resource, resource_status=None):
     markers_hit = [m for m in markers if m in str(e)]
     if not markers_hit:
         LOG.warning(
-            "Unexpected error retrieving details for resource type %s: Exception: %s - %s - status: %s",
+            "Unexpected error processing resource type %s: Exception: %s - %s - status: %s",
             resource_type,
             str(e),
             resource,
@@ -215,8 +205,7 @@ def extract_resource_attribute(
         if not resource_state:
             raise DependencyNotYetSatisfied(
                 resource_ids=resource_id,
-                message='Unable to fetch details for resource "%s" (attribute "%s")'
-                % (resource_id, attribute),
+                message=f'Unable to fetch details for resource "{resource_id}" (attribute "{attribute}")',
             )
 
     if isinstance(resource_state, GenericBaseModel):
@@ -226,8 +215,7 @@ def extract_resource_attribute(
             except Exception:
                 pass
         raise Exception(
-            'Unable to extract attribute "%s" from "%s" model class %s'
-            % (attribute, resource_type, type(resource_state))
+            f'Unable to extract attribute "{attribute}" from "{resource_type}" model class {type(resource_state)}'
         )
 
     # extract resource specific attributes
@@ -240,6 +228,11 @@ def extract_resource_attribute(
             "Value",
             resource.get("Value", resource_props.get("Properties", {}).get("Value")),
         )
+        param_value_type = resource_props.get("ParameterType") or ""
+        if param_value_type.startswith("AWS::SSM::Parameter::Value"):
+            param_value = resolve_ssm_parameter_value(
+                param_value_type, resource_props.get("ParameterValue")
+            )
         if is_ref_attr_or_arn:
             result = param_value
         elif isinstance(param_value, dict):
@@ -570,14 +563,15 @@ def resolve_placeholders_in_string(result, stack):
     resources = stack.resources
 
     def _replace(match):
-        parts = match.group(1).split(".")
+        ref_expression = match.group(1)
+        parts = ref_expression.split(".")
         if len(parts) >= 2:
-            resource_name, _, attr_name = match.group(1).partition(".")
+            resource_name, _, attr_name = ref_expression.partition(".")
             resolved = resolve_ref(stack, resource_name.strip(), attribute=attr_name.strip())
             if resolved is None:
                 raise DependencyNotYetSatisfied(
                     resource_ids=resource_name,
-                    message="Unable to resolve attribute ref %s" % match.group(1),
+                    message=f"Unable to resolve attribute ref {ref_expression}",
                 )
             return resolved
         if len(parts) == 1 and parts[0] in resources:
@@ -594,7 +588,7 @@ def resolve_placeholders_in_string(result, stack):
             if result is None:
                 raise DependencyNotYetSatisfied(
                     resource_ids=parts[0],
-                    message="Unable to resolve attribute ref %s" % match.group(1),
+                    message=f"Unable to resolve attribute ref {ref_expression}",
                 )
             # make sure we resolve any functions/placeholders in the extracted string
             result = resolve_refs_recursively(stack, result)
@@ -632,7 +626,9 @@ def update_resource(resource_id, stack):
 
     resource = resources[resource_id]
     resource_type = get_resource_type(resource)
-    if resource_type not in UPDATEABLE_RESOURCES:
+
+    resource_instance = get_resource_model_instance(resource["LogicalResourceId"], stack)
+    if not resource_instance.is_updatable():
         LOG.warning('Unable to update resource type "%s", id "%s"', resource_type, resource_id)
         return
     LOG.info("Updating resource %s of type %s", resource_id, resource_type)
@@ -1041,11 +1037,8 @@ class TemplateDeployer:
         """Return whether the given resource can be updated or not."""
         if not self.is_deployable_resource(resource) or not self.is_deployed(resource):
             return False
-        resource_type = get_resource_type(resource)
-        return (
-            resource_type in UPDATEABLE_RESOURCES
-            or resource_type.partition("AWS::")[-1] in UPDATEABLE_RESOURCES
-        )  # TODO: second case just a fall-back for now, delete when PRO is updated
+        resource_instance = get_resource_model_instance(resource["LogicalResourceId"], self.stack)
+        return resource_instance.is_updatable()
 
     def all_resource_dependencies_satisfied(self, resource):
         unsatisfied = self.get_unsatisfied_dependencies(resource)
@@ -1178,9 +1171,7 @@ class TemplateDeployer:
         self, logical_id: str, param_type: str, default_value: Optional[str] = None
     ) -> Optional[str]:
         if param_type == "AWS::SSM::Parameter::Value<String>":
-            ssm_client = aws_stack.connect_to_service("ssm")
-            param = ssm_client.get_parameter(Name=default_value)
-            return param["Parameter"]["Value"]
+            return resolve_ssm_parameter_value(param_type, default_value)
         return None
 
     def apply_parameter_changes(self, old_stack, new_stack) -> None:

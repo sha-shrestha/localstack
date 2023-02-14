@@ -98,7 +98,7 @@ def _trigger_stop():
 def startup_monitor() -> None:
     """
     The startup monitor is a thread that waits for the startup_monitor_event and, once the event is true, starts a
-    localstack instance in it's own thread context.
+    localstack instance in its own thread context.
     """
     logger.info("waiting on localstack_start signal")
     startup_monitor_event.wait()
@@ -199,9 +199,9 @@ def import_apigw(apigateway_client):
     rest_api_ids = []
 
     def _import_apigateway_function(*args, **kwargs):
-        api_id, name, root_id = import_rest_api(apigateway_client, **kwargs)
-        rest_api_ids.append(api_id)
-        return api_id, name, root_id
+        response, root_id = import_rest_api(apigateway_client, **kwargs)
+        rest_api_ids.append(response.get("id"))
+        return response, root_id
 
     yield _import_apigateway_function
 

@@ -81,9 +81,9 @@ def register(router: Router[Handler]):
 
     :param router: the router to add the handlers into.
     """
-    router.add_route_endpoint(path_strategy_handler)
-    router.add_route_endpoint(domain_strategy_handler)
-    router.add_route_endpoint(legacy_handler)
+    router.add(path_strategy_handler)
+    router.add(domain_strategy_handler)
+    router.add(legacy_handler)
 
 
 class UnknownOperationException(Exception):
@@ -131,7 +131,7 @@ def handle_request(request: Request, region: str) -> Response:
         op = service.operation_model(service.operation_names[0])
         return serializer.serialize_error_to_response(
             CommonServiceException(
-                "InternalError", f"An internal error ocurred: {e}", status_code=500
+                "InternalError", f"An internal error occurred: {e}", status_code=500
             ),
             op,
             request.headers,

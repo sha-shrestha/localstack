@@ -26,6 +26,7 @@ from localstack.constants import TEST_AWS_ACCESS_KEY_ID, TEST_AWS_SECRET_ACCESS_
 from localstack.services.stores import (
     AccountRegionBundle,
     BaseStore,
+    CrossAccountAttribute,
     CrossRegionAttribute,
     LocalAttribute,
 )
@@ -709,19 +710,15 @@ def sns_allow_topic_sqs_queue(sqs_client):
 
 
 @pytest.fixture
-def sns_create_sqs_subscription(sns_client, sqs_client, sns_allow_topic_sqs_queue):
+def sns_create_sqs_subscription(sns_client, sqs_client, sns_allow_topic_sqs_queue, sqs_queue_arn):
     subscriptions = []
 
-    def _factory(topic_arn: str, queue_url: str) -> Dict[str, str]:
-        queue_arn = sqs_client.get_queue_attributes(
-            QueueUrl=queue_url, AttributeNames=["QueueArn"]
-        )["Attributes"]["QueueArn"]
+    def _factory(topic_arn: str, queue_url: str, **kwargs) -> Dict[str, str]:
+        queue_arn = sqs_queue_arn(queue_url=queue_url)
 
         # connect sns topic to sqs
         subscription = sns_client.subscribe(
-            TopicArn=topic_arn,
-            Protocol="sqs",
-            Endpoint=queue_arn,
+            TopicArn=topic_arn, Protocol="sqs", Endpoint=queue_arn, **kwargs
         )
         subscription_arn = subscription["SubscriptionArn"]
 
@@ -936,7 +933,10 @@ def kms_create_key(create_boto_client):
 
     for region, key_id in key_ids:
         try:
-            create_boto_client("kms", region).schedule_key_deletion(KeyId=key_id)
+            # shortest amount of time you can schedule the deletion
+            create_boto_client("kms", region).schedule_key_deletion(
+                KeyId=key_id, PendingWindowInDays=7
+            )
         except Exception as e:
             exception_message = str(e)
             # Some tests schedule their keys for deletion themselves.
@@ -960,7 +960,10 @@ def kms_replicate_key(create_boto_client):
 
     for region_to, key_id in key_ids:
         try:
-            create_boto_client("kms", region_to).schedule_key_deletion(KeyId=key_id)
+            # shortest amount of time you can schedule the deletion
+            create_boto_client("kms", region_to).schedule_key_deletion(
+                KeyId=key_id, PendingWindowInDays=7
+            )
         except Exception as e:
             LOG.debug("error cleaning up KMS key %s: %s", key_id, e)
 
@@ -1101,7 +1104,7 @@ def opensearch_document_path(opensearch_client, opensearch_endpoint):
         "about": "I'm just a simple man, trying to make my way in the universe.",
         "interests": ["mandalorian armor", "tusken culture"],
     }
-    document_path = f"{opensearch_endpoint}/bounty/hunters/1"
+    document_path = f"{opensearch_endpoint}/bountyhunters/_doc/1"
     response = requests.put(
         document_path,
         data=json.dumps(document),
@@ -1543,10 +1546,23 @@ def create_user(iam_client):
                     attached_policy["PolicyArn"],
                     username,
                 )
+        access_keys = iam_client.list_access_keys(UserName=username)["AccessKeyMetadata"]
+        for access_key in access_keys:
+            try:
+                iam_client.delete_access_key(
+                    UserName=username, AccessKeyId=access_key["AccessKeyId"]
+                )
+            except Exception:
+                LOG.debug(
+                    "Error deleting access key '%s' from user '%s'",
+                    access_key["AccessKeyId"],
+                    username,
+                )
+
         try:
             iam_client.delete_user(UserName=username)
-        except Exception:
-            LOG.debug("Error deleting user '%s' during test cleanup", username)
+        except Exception as e:
+            LOG.debug("Error deleting user '%s' during test cleanup: %s", username, e)
 
 
 @pytest.fixture
@@ -1916,6 +1932,7 @@ def pytest_collection_modifyitems(config: Config, items: list[Item]):
 @pytest.fixture
 def sample_stores() -> AccountRegionBundle:
     class SampleStore(BaseStore):
+        CROSS_ACCOUNT_ATTR = CrossAccountAttribute(default=list)
         CROSS_REGION_ATTR = CrossRegionAttribute(default=list)
         region_specific_attr = LocalAttribute(default=list)
 

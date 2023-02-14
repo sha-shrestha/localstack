@@ -53,6 +53,7 @@ MaxLayerListItems = int
 MaxListItems = int
 MaxProvisionedConcurrencyConfigListItems = int
 MaximumBatchingWindowInSeconds = int
+MaximumConcurrency = int
 MaximumEventAgeInSeconds = int
 MaximumRecordAgeInSeconds = int
 MaximumRetryAttempts = int
@@ -75,6 +76,7 @@ Queue = str
 ReservedConcurrentExecutions = int
 ResourceArn = str
 RoleArn = str
+RuntimeVersionArn = str
 S3Bucket = str
 S3Key = str
 S3ObjectVersion = str
@@ -284,6 +286,12 @@ class ThrottleReason(str):
 class TracingMode(str):
     Active = "Active"
     PassThrough = "PassThrough"
+
+
+class UpdateRuntimeOn(str):
+    Auto = "Auto"
+    Manual = "Manual"
+    FunctionUpdate = "FunctionUpdate"
 
 
 class CodeSigningConfigNotFoundException(ServiceException):
@@ -687,6 +695,10 @@ class CreateCodeSigningConfigResponse(TypedDict, total=False):
     CodeSigningConfig: CodeSigningConfig
 
 
+class ScalingConfig(TypedDict, total=False):
+    MaximumConcurrency: Optional[MaximumConcurrency]
+
+
 class SelfManagedKafkaEventSourceConfig(TypedDict, total=False):
     ConsumerGroupId: Optional[URI]
 
@@ -759,6 +771,7 @@ class CreateEventSourceMappingRequest(ServiceRequest):
     FunctionResponseTypes: Optional[FunctionResponseTypeList]
     AmazonManagedKafkaEventSourceConfig: Optional[AmazonManagedKafkaEventSourceConfig]
     SelfManagedKafkaEventSourceConfig: Optional[SelfManagedKafkaEventSourceConfig]
+    ScalingConfig: Optional[ScalingConfig]
 
 
 class SnapStart(TypedDict, total=False):
@@ -947,6 +960,7 @@ class EventSourceMappingConfiguration(TypedDict, total=False):
     FunctionResponseTypes: Optional[FunctionResponseTypeList]
     AmazonManagedKafkaEventSourceConfig: Optional[AmazonManagedKafkaEventSourceConfig]
     SelfManagedKafkaEventSourceConfig: Optional[SelfManagedKafkaEventSourceConfig]
+    ScalingConfig: Optional[ScalingConfig]
 
 
 EventSourceMappingsList = List[EventSourceMappingConfiguration]
@@ -958,6 +972,16 @@ class FunctionCodeLocation(TypedDict, total=False):
     Location: Optional[String]
     ImageUri: Optional[String]
     ResolvedImageUri: Optional[String]
+
+
+class RuntimeVersionError(TypedDict, total=False):
+    ErrorCode: Optional[String]
+    Message: Optional[SensitiveString]
+
+
+class RuntimeVersionConfig(TypedDict, total=False):
+    RuntimeVersionArn: Optional[RuntimeVersionArn]
+    Error: Optional[RuntimeVersionError]
 
 
 class SnapStartResponse(TypedDict, total=False):
@@ -1030,6 +1054,7 @@ class FunctionConfiguration(TypedDict, total=False):
     Architectures: Optional[ArchitecturesList]
     EphemeralStorage: Optional[EphemeralStorage]
     SnapStart: Optional[SnapStartResponse]
+    RuntimeVersionConfig: Optional[RuntimeVersionConfig]
 
 
 class FunctionEventInvokeConfig(TypedDict, total=False):
@@ -1196,6 +1221,16 @@ class GetProvisionedConcurrencyConfigResponse(TypedDict, total=False):
     Status: Optional[ProvisionedConcurrencyStatusEnum]
     StatusReason: Optional[String]
     LastModified: Optional[Timestamp]
+
+
+class GetRuntimeManagementConfigRequest(ServiceRequest):
+    FunctionName: FunctionName
+    Qualifier: Optional[Qualifier]
+
+
+class GetRuntimeManagementConfigResponse(TypedDict, total=False):
+    UpdateRuntimeOn: Optional[UpdateRuntimeOn]
+    RuntimeVersionArn: Optional[RuntimeVersionArn]
 
 
 class InvocationRequest(ServiceRequest):
@@ -1466,6 +1501,19 @@ class PutProvisionedConcurrencyConfigResponse(TypedDict, total=False):
     LastModified: Optional[Timestamp]
 
 
+class PutRuntimeManagementConfigRequest(ServiceRequest):
+    FunctionName: FunctionName
+    Qualifier: Optional[Qualifier]
+    UpdateRuntimeOn: UpdateRuntimeOn
+    RuntimeVersionArn: Optional[RuntimeVersionArn]
+
+
+class PutRuntimeManagementConfigResponse(TypedDict, total=False):
+    UpdateRuntimeOn: UpdateRuntimeOn
+    FunctionArn: FunctionArn
+    RuntimeVersionArn: Optional[RuntimeVersionArn]
+
+
 class RemoveLayerVersionPermissionRequest(ServiceRequest):
     LayerName: LayerName
     VersionNumber: LayerVersionNumber
@@ -1528,6 +1576,7 @@ class UpdateEventSourceMappingRequest(ServiceRequest):
     SourceAccessConfigurations: Optional[SourceAccessConfigurations]
     TumblingWindowInSeconds: Optional[TumblingWindowInSeconds]
     FunctionResponseTypes: Optional[FunctionResponseTypeList]
+    ScalingConfig: Optional[ScalingConfig]
 
 
 class UpdateFunctionCodeRequest(ServiceRequest):
@@ -1672,6 +1721,7 @@ class LambdaApi:
         function_response_types: FunctionResponseTypeList = None,
         amazon_managed_kafka_event_source_config: AmazonManagedKafkaEventSourceConfig = None,
         self_managed_kafka_event_source_config: SelfManagedKafkaEventSourceConfig = None,
+        scaling_config: ScalingConfig = None,
     ) -> EventSourceMappingConfiguration:
         raise NotImplementedError
 
@@ -1882,6 +1932,12 @@ class LambdaApi:
     ) -> GetProvisionedConcurrencyConfigResponse:
         raise NotImplementedError
 
+    @handler("GetRuntimeManagementConfig")
+    def get_runtime_management_config(
+        self, context: RequestContext, function_name: FunctionName, qualifier: Qualifier = None
+    ) -> GetRuntimeManagementConfigResponse:
+        raise NotImplementedError
+
     @handler("Invoke")
     def invoke(
         self,
@@ -2084,6 +2140,17 @@ class LambdaApi:
     ) -> PutProvisionedConcurrencyConfigResponse:
         raise NotImplementedError
 
+    @handler("PutRuntimeManagementConfig")
+    def put_runtime_management_config(
+        self,
+        context: RequestContext,
+        function_name: FunctionName,
+        update_runtime_on: UpdateRuntimeOn,
+        qualifier: Qualifier = None,
+        runtime_version_arn: RuntimeVersionArn = None,
+    ) -> PutRuntimeManagementConfigResponse:
+        raise NotImplementedError
+
     @handler("RemoveLayerVersionPermission")
     def remove_layer_version_permission(
         self,
@@ -2158,6 +2225,7 @@ class LambdaApi:
         source_access_configurations: SourceAccessConfigurations = None,
         tumbling_window_in_seconds: TumblingWindowInSeconds = None,
         function_response_types: FunctionResponseTypeList = None,
+        scaling_config: ScalingConfig = None,
     ) -> EventSourceMappingConfiguration:
         raise NotImplementedError
 

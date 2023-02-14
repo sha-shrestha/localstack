@@ -22,10 +22,12 @@ import requests
 import xmltodict
 from boto3.s3.transfer import KB, TransferConfig
 from botocore import UNSIGNED
+from botocore.auth import SigV4Auth
 from botocore.client import Config
 from botocore.exceptions import ClientError
 
 from localstack import config, constants
+from localstack.aws.api.s3 import StorageClass
 from localstack.config import LEGACY_S3_PROVIDER
 from localstack.constants import (
     LOCALHOST_HOSTNAME,
@@ -153,9 +155,12 @@ def s3_create_bucket_with_client(s3_resource):
 
 @pytest.fixture
 def s3_multipart_upload(s3_client):
-    def perform_multipart_upload(bucket, key, data=None, zipped=False, acl=None, parts: int = 1):
+    def perform_multipart_upload(
+        bucket, key, data=None, zipped=False, acl=None, parts: int = 1, **kwargs
+    ):
         # beware, the last part can be under 5 MiB, but previous parts needs to be between 5MiB and 5GiB
-        kwargs = {"ACL": acl} if acl else {}
+        if acl:
+            kwargs["ACL"] = acl
         multipart_upload_dict = s3_client.create_multipart_upload(Bucket=bucket, Key=key, **kwargs)
         upload_id = multipart_upload_dict["UploadId"]
         data = data or (5 * short_uid())
@@ -633,10 +638,10 @@ class TestS3:
         snapshot.match("expected_error", e.value.response)
 
     @pytest.mark.aws_validated
-    @pytest.mark.skip_snapshot_verify(path="$..RequestID")
+    @pytest.mark.skip_snapshot_verify(condition=is_old_provider, path="$..RequestID")
     def test_delete_bucket_no_such_bucket(self, s3_client, snapshot):
         with pytest.raises(ClientError) as e:
-            s3_client.delete_bucket(Bucket=f"does-not-exist-{short_uid()}")
+            s3_client.delete_bucket(Bucket="does-not-exist-localstack-test")
 
         snapshot.match("expected_error", e.value.response)
 
@@ -688,7 +693,7 @@ class TestS3:
     @pytest.mark.skip_snapshot_verify(
         condition=is_old_provider, paths=["$..VersionId", "$..Error.RequestID"]
     )
-    def test_multipart_and_list_parts(self, s3_client, s3_bucket, s3_multipart_upload, snapshot):
+    def test_multipart_and_list_parts(self, s3_client, s3_bucket, snapshot):
         snapshot.add_transformer(
             [
                 snapshot.transform.key_value("Bucket", reference_replacement=False),
@@ -768,7 +773,9 @@ class TestS3:
         snapshot.match("exc", e.value.response)
 
     @pytest.mark.aws_validated
-    @pytest.mark.skip_snapshot_verify(paths=["$..Error.Key", "$..Error.RequestID"])
+    @pytest.mark.skip_snapshot_verify(
+        condition=is_old_provider, paths=["$..Error.Key", "$..Error.RequestID"]
+    )
     def test_range_key_not_exists(self, s3_client, s3_bucket, snapshot):
         key = "my-key"
         with pytest.raises(ClientError) as e:
@@ -928,7 +935,7 @@ class TestS3:
         assert response["ResponseMetadata"]["HTTPStatusCode"] == 200
 
     @pytest.mark.aws_validated
-    @pytest.mark.skip_snapshot_verify(paths=["$..AcceptRanges"])
+    @pytest.mark.skip_snapshot_verify(condition=is_old_provider, paths=["$..AcceptRanges"])
     def test_s3_copy_metadata_replace(self, s3_client, s3_create_bucket, snapshot):
         snapshot.add_transformer(snapshot.transform.s3_api())
 
@@ -961,7 +968,7 @@ class TestS3:
         snapshot.match("head_object_copy", head_object)
 
     @pytest.mark.aws_validated
-    @pytest.mark.skip_snapshot_verify(paths=["$..AcceptRanges"])
+    @pytest.mark.skip_snapshot_verify(condition=is_old_provider, paths=["$..AcceptRanges"])
     def test_s3_copy_content_type_and_metadata(self, s3_client, s3_create_bucket, snapshot):
         snapshot.add_transformer(snapshot.transform.s3_api())
         object_key = "source-object"
@@ -1004,13 +1011,14 @@ class TestS3:
         snapshot.match("head_object_second_copy", head_object)
 
     @pytest.mark.aws_validated
-    @pytest.mark.xfail(
-        reason="wrong behaviour, see https://docs.aws.amazon.com/AmazonS3/latest/userguide/managing-acls.html"
+    # behaviour is wrong in Legacy, we inherit Bucket ACL
+    @pytest.mark.skip_snapshot_verify(
+        condition=is_old_provider,
+        paths=["$..Grants..Grantee.DisplayName", "$.permission-acl-key1.Grants"],
     )
     def test_s3_multipart_upload_acls(
         self, s3_client, s3_create_bucket, s3_multipart_upload, snapshot
     ):
-        # The basis for this test is wrong - see:
         # https://docs.aws.amazon.com/AmazonS3/latest/userguide/managing-acls.html
         # > Bucket and object permissions are independent of each other. An object does not inherit the permissions
         # > from its bucket. For example, if you create a bucket and grant write access to a user, you can't access
@@ -1175,6 +1183,47 @@ class TestS3:
             s3_client.put_bucket_acl(Bucket=s3_bucket, AccessControlPolicy=acp)
         snapshot.match("put-bucket-acp-acl-6", e.value.response)
 
+        # test setting empty ACP
+        with pytest.raises(ClientError) as e:
+            s3_client.put_bucket_acl(Bucket=s3_bucket, AccessControlPolicy={})
+
+        snapshot.match("put-bucket-empty-acp", e.value.response)
+
+        # test setting nothing
+        with pytest.raises(ClientError) as e:
+            s3_client.put_bucket_acl(Bucket=s3_bucket)
+
+        snapshot.match("put-bucket-empty", e.value.response)
+
+        # test setting two different kind of valid ACL
+        with pytest.raises(ClientError) as e:
+            s3_client.put_bucket_acl(
+                Bucket=s3_bucket,
+                ACL="private",
+                GrantRead='uri="http://acs.amazonaws.com/groups/s3/LogDelivery"',
+            )
+
+        snapshot.match("put-bucket-two-type-acl", e.value.response)
+
+        # test setting again two different kind of valid ACL
+        acp = {
+            "Owner": owner,
+            "Grants": [
+                {
+                    "Grantee": {"ID": owner["ID"], "Type": "CanonicalUser"},
+                    "Permission": "FULL_CONTROL",
+                },
+            ],
+        }
+        with pytest.raises(ClientError) as e:
+            s3_client.put_bucket_acl(
+                Bucket=s3_bucket,
+                ACL="private",
+                AccessControlPolicy=acp,
+            )
+
+        snapshot.match("put-bucket-two-type-acl-acp", e.value.response)
+
     @pytest.mark.aws_validated
     @pytest.mark.skip_snapshot_verify(paths=["$..Restore"])
     @pytest.mark.skip_snapshot_verify(
@@ -1331,6 +1380,11 @@ class TestS3:
 
         response = client_2.get_bucket_location(Bucket=bucket_3_name)
         snapshot.match("get_bucket_location_bucket_3", response)
+
+        with pytest.raises(ClientError) as exc:
+            s3_client.get_bucket_location(Bucket=f"random-bucket-test-{short_uid()}")
+
+        snapshot.match("get_bucket_location_non_existent_bucket", exc.value.response)
 
     @pytest.mark.aws_validated
     @pytest.mark.skip_snapshot_verify(
@@ -1783,8 +1837,7 @@ class TestS3:
         )
 
     @pytest.mark.aws_validated
-    # TODO LocalStack adds this RequestID to the error response
-    @pytest.mark.skip_snapshot_verify(paths=["$..Error.RequestID"])
+    @pytest.mark.skip_snapshot_verify(condition=is_old_provider, paths=["$..Error.RequestID"])
     def test_precondition_failed_error(self, s3_client, s3_create_bucket, snapshot):
         bucket = f"bucket-{short_uid()}"
 
@@ -1904,9 +1957,29 @@ class TestS3:
         assert response.status_code == 200
         assert to_str(response.content) == content
 
+    @pytest.mark.only_localstack
+    def test_s3_hostname_with_subdomain(self, aws_http_client_factory):
+        """
+        This particular test validates the fix for localstack#7424
+        Moto would still validate with the `host` header if buckets where subdomain based even though in the new ASF
+        provider, every request was forwarded by the VirtualHost proxy.
+        """
+        s3_http_client = aws_http_client_factory("s3", signer_factory=SigV4Auth)
+        endpoint_url = _endpoint_url()
+        # this will represent a ListBuckets call, calling the base endpoint
+        resp = s3_http_client.get(endpoint_url)
+        assert resp.ok
+        assert resp.ok
+        assert b"<Bucket" in resp.content
+
+        # the same ListBuckets call, but with subdomain based `host` header
+        resp = s3_http_client.get(endpoint_url, headers={"host": "aws.test.local"})
+        assert resp.ok
+        assert b"<Bucket" in resp.content
+
     @pytest.mark.skip_offline
     @pytest.mark.aws_validated
-    @pytest.mark.skip_snapshot_verify(paths=["$..AcceptRanges"])
+    @pytest.mark.skip_snapshot_verify(condition=is_old_provider, paths=["$..AcceptRanges"])
     def test_s3_lambda_integration(
         self,
         lambda_client,
@@ -2212,7 +2285,7 @@ class TestS3:
         snapshot.match("list-objects", resp)
 
     @pytest.mark.aws_validated
-    @pytest.mark.skip_snapshot_verify(paths=["$..AcceptRanges"])
+    @pytest.mark.skip_snapshot_verify(condition=is_old_provider, paths=["$..AcceptRanges"])
     def test_upload_big_file(self, s3_client, s3_create_bucket, snapshot):
         snapshot.add_transformer(snapshot.transform.s3_api())
         bucket_name = f"bucket-{short_uid()}"
@@ -2599,6 +2672,340 @@ class TestS3:
         assert len(proxied_response.headers["server"].split(",")) == 1
         assert len(proxied_response.headers["date"].split(",")) == 2  # coma in the date
 
+    @pytest.mark.aws_validated
+    @pytest.mark.xfail(
+        condition=LEGACY_S3_PROVIDER, reason="Validation not implemented in legacy provider"
+    )
+    def test_s3_sse_validate_kms_key(
+        self,
+        s3_client,
+        s3_create_bucket,
+        kms_create_key,
+        monkeypatch,
+        snapshot,
+    ):
+        snapshot.add_transformer(snapshot.transform.key_value("Description"))
+        data = b"test-sse"
+        bucket_name = f"bucket-test-kms-{short_uid()}"
+        s3_create_bucket(
+            Bucket=bucket_name, CreateBucketConfiguration={"LocationConstraint": "us-west-2"}
+        )
+        # create key in a different region than the bucket
+        kms_key = kms_create_key(region="us-east-1")
+        # snapshot the KMS key to save the UUID for replacement in Error message.
+        snapshot.match("create-kms-key", kms_key)
+
+        # test whether the validation is skipped when not disabling the validation
+        if not is_aws_cloud():
+            key_name = "test-sse-validate-kms-key-no-check"
+            response = s3_client.put_object(
+                Bucket=bucket_name,
+                Key=key_name,
+                Body=data,
+                ServerSideEncryption="aws:kms",
+                SSEKMSKeyId="fake-key-id",
+            )
+            assert response["ResponseMetadata"]["HTTPStatusCode"] == 200
+
+            response = s3_client.create_multipart_upload(
+                Bucket=bucket_name,
+                Key="multipart-test-sse-validate-kms-key-no-check",
+                ServerSideEncryption="aws:kms",
+                SSEKMSKeyId="fake-key-id",
+            )
+            assert response["ResponseMetadata"]["HTTPStatusCode"] == 200
+
+            response = s3_client.copy_object(
+                Bucket=bucket_name,
+                Key="copy-test-sse-validate-kms-key-no-check",
+                CopySource={"Bucket": bucket_name, "Key": key_name},
+                ServerSideEncryption="aws:kms",
+                SSEKMSKeyId="fake-key-id",
+            )
+            assert response["ResponseMetadata"]["HTTPStatusCode"] == 200
+
+        key_name = "test-sse-validate-kms-key"
+        fake_key_uuid = "134f2428-cec1-4b25-a1ae-9048164dba47"
+
+        # activating the validation, for AWS parity
+        monkeypatch.setattr(config, "S3_SKIP_KMS_KEY_VALIDATION", False)
+        with pytest.raises(ClientError) as e:
+            s3_client.put_object(
+                Bucket=bucket_name,
+                Key=key_name,
+                Body=data,
+                ServerSideEncryption="aws:kms",
+                SSEKMSKeyId="fake-key-id",
+            )
+        snapshot.match("put-obj-wrong-kms-key", e.value.response)
+
+        with pytest.raises(ClientError) as e:
+            s3_client.put_object(
+                Bucket=bucket_name,
+                Key=key_name,
+                Body=data,
+                ServerSideEncryption="aws:kms",
+                SSEKMSKeyId=fake_key_uuid,
+            )
+        snapshot.match("put-obj-wrong-kms-key-real-uuid", e.value.response)
+
+        # we create a wrong arn but with the right region to test error message
+        wrong_id_arn = (
+            kms_key["Arn"]
+            .replace("us-east-1", "us-west-2")
+            .replace(kms_key["KeyId"], fake_key_uuid)
+        )
+        with pytest.raises(ClientError) as e:
+            s3_client.put_object(
+                Bucket=bucket_name,
+                Key=key_name,
+                Body=data,
+                ServerSideEncryption="aws:kms",
+                SSEKMSKeyId=wrong_id_arn,
+            )
+        snapshot.match("put-obj-wrong-kms-key-real-uuid-arn", e.value.response)
+
+        with pytest.raises(ClientError) as e:
+            s3_client.put_object(
+                Bucket=bucket_name,
+                Key="test-sse-validate-kms-key-no-check-region",
+                Body=data,
+                ServerSideEncryption="aws:kms",
+                SSEKMSKeyId=kms_key["Arn"],
+            )
+        snapshot.match("put-obj-different-region-kms-key", e.value.response)
+
+        with pytest.raises(ClientError) as e:
+            s3_client.put_object(
+                Bucket=bucket_name,
+                Key="test-sse-validate-kms-key-different-region-no-arn",
+                Body=data,
+                ServerSideEncryption="aws:kms",
+                SSEKMSKeyId=kms_key["KeyId"],
+            )
+        snapshot.match("put-obj-different-region-kms-key-no-arn", e.value.response)
+
+        with pytest.raises(ClientError) as e:
+            s3_client.create_multipart_upload(
+                Bucket=bucket_name,
+                Key="multipart-test-sse-validate-kms-key-no-check",
+                ServerSideEncryption="aws:kms",
+                SSEKMSKeyId="fake-key-id",
+            )
+        snapshot.match("create-multipart-wrong-kms-key", e.value.response)
+
+        # create a object to be copied
+        src_key = "key-to-be-copied"
+        s3_client.put_object(Bucket=bucket_name, Key=src_key, Body=b"test-data")
+        with pytest.raises(ClientError) as e:
+            s3_client.copy_object(
+                Bucket=bucket_name,
+                Key="copy-test-sse-validate-kms-key-no-check",
+                CopySource={"Bucket": bucket_name, "Key": src_key},
+                ServerSideEncryption="aws:kms",
+                SSEKMSKeyId="fake-key-id",
+            )
+        snapshot.match("copy-obj-wrong-kms-key", e.value.response)
+
+    @pytest.mark.aws_validated
+    @pytest.mark.xfail(
+        condition=LEGACY_S3_PROVIDER, reason="Validation not implemented in legacy provider"
+    )
+    def test_complete_multipart_parts_order(self, s3_client, s3_bucket, snapshot):
+        snapshot.add_transformer(
+            [
+                snapshot.transform.key_value("Bucket", reference_replacement=False),
+                snapshot.transform.key_value("Location"),
+                snapshot.transform.key_value("UploadId"),
+            ]
+        )
+
+        key_name = "test-order-parts"
+        response = s3_client.create_multipart_upload(Bucket=s3_bucket, Key=key_name)
+        upload_id = response["UploadId"]
+
+        # data must be at least 5MiB
+        part_data = "a" * (5_242_880 + 1)
+        part_data = to_bytes(part_data)
+
+        parts = 3
+        multipart_upload_parts = []
+        for part in range(parts):
+            # Write contents to memory rather than a file.
+            part_number = part + 1
+            upload_file_object = BytesIO(part_data)
+            response = s3_client.upload_part(
+                Bucket=s3_bucket,
+                Key=key_name,
+                Body=upload_file_object,
+                PartNumber=part_number,
+                UploadId=upload_id,
+            )
+            multipart_upload_parts.append({"ETag": response["ETag"], "PartNumber": part_number})
+
+        # testing completing the multipart with an unordered sequence of parts
+        with pytest.raises(ClientError) as e:
+            s3_client.complete_multipart_upload(
+                Bucket=s3_bucket,
+                Key=key_name,
+                MultipartUpload={"Parts": list(reversed(multipart_upload_parts))},
+                UploadId=upload_id,
+            )
+        snapshot.match("complete-multipart-unordered", e.value.response)
+
+        response = s3_client.complete_multipart_upload(
+            Bucket=s3_bucket,
+            Key=key_name,
+            MultipartUpload={"Parts": multipart_upload_parts},
+            UploadId=upload_id,
+        )
+        snapshot.match("complete-multipart-ordered", response)
+
+        # testing completing the multipart with a sequence of parts number going from 2, 4, and 6 (missing numbers)
+        key_name_2 = "key-sequence-with-step-2"
+        response = s3_client.create_multipart_upload(Bucket=s3_bucket, Key=key_name_2)
+        upload_id = response["UploadId"]
+
+        multipart_upload_parts = []
+        for part in range(parts):
+            # Write contents to memory rather than a file.
+            part_number = part + 2
+            upload_file_object = BytesIO(part_data)
+            response = s3_client.upload_part(
+                Bucket=s3_bucket,
+                Key=key_name_2,
+                Body=upload_file_object,
+                PartNumber=part_number,
+                UploadId=upload_id,
+            )
+            multipart_upload_parts.append({"ETag": response["ETag"], "PartNumber": part_number})
+
+        response = s3_client.complete_multipart_upload(
+            Bucket=s3_bucket,
+            Key=key_name_2,
+            MultipartUpload={"Parts": multipart_upload_parts},
+            UploadId=upload_id,
+        )
+        snapshot.match("complete-multipart-with-step-2", response)
+
+    @pytest.mark.aws_validated
+    @pytest.mark.parametrize(
+        "storage_class",
+        [
+            StorageClass.STANDARD,
+            StorageClass.STANDARD_IA,
+            StorageClass.GLACIER,
+            StorageClass.GLACIER_IR,
+            StorageClass.REDUCED_REDUNDANCY,
+            StorageClass.ONEZONE_IA,
+            StorageClass.INTELLIGENT_TIERING,
+            StorageClass.DEEP_ARCHIVE,
+        ],
+    )
+    @pytest.mark.xfail(condition=LEGACY_S3_PROVIDER, reason="Patched only in ASF provider")
+    def test_put_object_storage_class(self, s3_client, s3_bucket, snapshot, storage_class):
+        key_name = "test-put-object-storage-class"
+        s3_client.put_object(
+            Bucket=s3_bucket,
+            Key=key_name,
+            Body=b"body-test",
+            StorageClass=storage_class,
+        )
+
+        response = s3_client.get_object_attributes(
+            Bucket=s3_bucket,
+            Key=key_name,
+            ObjectAttributes=["StorageClass"],
+        )
+        snapshot.match("put-object-storage-class", response)
+
+    @pytest.mark.aws_validated
+    @pytest.mark.xfail(
+        condition=LEGACY_S3_PROVIDER, reason="Validation not implemented in legacy provider"
+    )
+    def test_put_object_storage_class_outposts(
+        self, s3_client, s3_bucket, s3_multipart_upload, snapshot
+    ):
+        key_name = "test-put-object-storage-class"
+        with pytest.raises(ClientError) as e:
+            s3_client.put_object(
+                Bucket=s3_bucket,
+                Key=key_name,
+                Body=b"body-test",
+                StorageClass=StorageClass.OUTPOSTS,
+            )
+        snapshot.match("put-object-outposts", e.value.response)
+
+        key_name = "test-multipart-storage-class"
+        with pytest.raises(ClientError) as e:
+            s3_client.create_multipart_upload(
+                Bucket=s3_bucket,
+                Key=key_name,
+                StorageClass=StorageClass.OUTPOSTS,
+            )
+        snapshot.match("create-multipart-outposts-exc", e.value.response)
+
+    @pytest.mark.aws_validated
+    def test_response_structure(self, aws_http_client_factory, s3_bucket):
+        """
+        Test that the response structure is correct for the S3 API
+        """
+        headers = {"x-amz-content-sha256": "UNSIGNED-PAYLOAD"}
+
+        s3_http_client = aws_http_client_factory("s3", signer_factory=SigV4Auth)
+
+        def get_xml_content(http_response_content: bytes) -> bytes:
+            # just format a bit the XML, nothing bad parity wise, but allow the test to run against AWS
+            return http_response_content.replace(b"'", b'"').replace(b"utf", b"UTF")
+
+        # Lists all buckets
+        endpoint_url = _endpoint_url()
+        resp = s3_http_client.get(endpoint_url, headers=headers)
+        if is_asf_provider():
+            # legacy provider does not add XML preample for ListAllMyBucketsResult
+            assert b'<?xml version="1.0" encoding="UTF-8"?>\n' in get_xml_content(resp.content)
+
+        resp_dict = xmltodict.parse(resp.content)
+        assert "ListAllMyBucketsResult" in resp_dict
+
+        # Lists all objects in a bucket
+        bucket_url = _bucket_url(s3_bucket)
+        resp = s3_http_client.get(bucket_url, headers=headers)
+        assert b'<?xml version="1.0" encoding="UTF-8"?>\n' in get_xml_content(resp.content)
+        resp_dict = xmltodict.parse(resp.content)
+        assert "ListBucketResult" in resp_dict
+
+        location_constraint_url = f"{bucket_url}?location"
+        resp = s3_http_client.get(location_constraint_url, headers=headers)
+        assert b'<?xml version="1.0" encoding="UTF-8"?>\n' in get_xml_content(resp.content)
+
+    @pytest.mark.aws_validated
+    def test_s3_delete_objects_trailing_slash(self, s3_client, aws_http_client_factory, s3_bucket):
+        object_key = "key-to-delete-trailing-slash"
+        # create an object to delete
+        s3_client.put_object(Bucket=s3_bucket, Key=object_key, Body=b"123")
+
+        headers = {"x-amz-content-sha256": "UNSIGNED-PAYLOAD"}
+        s3_http_client = aws_http_client_factory("s3", signer_factory=SigV4Auth)
+
+        # Endpoint as created by Rust and AWS JS SDK v3
+        bucket_url = f"{_bucket_url(s3_bucket)}/?delete&x-id=DeleteObjects"
+
+        delete_body = f"""<Delete>
+            <Object>
+                <Key>{object_key}</Key>
+             </Object>
+        </Delete>
+        """
+
+        # Post the request to delete the objects, with a trailing slash in the URL
+        resp = s3_http_client.post(bucket_url, headers=headers, data=delete_body)
+        assert resp.status_code == 200
+
+        resp_dict = xmltodict.parse(resp.content)
+        assert "DeleteResult" in resp_dict
+        assert resp_dict["DeleteResult"]["Deleted"]["Key"] == object_key
+
 
 class TestS3TerraformRawRequests:
     @pytest.mark.only_localstack
@@ -2652,21 +3059,13 @@ class TestS3PresignedUrl:
             s3_presigned_client.meta.events.unregister("before-sign.s3.GetObject", add_query_param)
 
     @pytest.mark.only_localstack
-    @pytest.mark.xfail(
-        condition=not LEGACY_S3_PROVIDER,
-        reason="failing for ASF provider, will be fixed in separate PR",
-    )
     def test_presign_check_signature_validation_for_port_permutation(
         self, s3_client, s3_bucket, patch_s3_skip_signature_validation_false
     ):
-        port1 = 443
-        port2 = config.EDGE_PORT
-        endpoint = (
-            f"http://{config.LOCALSTACK_HOSTNAME}:{port1}"  # .replace(f":{port2}", f":{port1}")
-        )
+        host = f"{S3_VIRTUAL_HOSTNAME}:{config.EDGE_PORT}"
         s3_presign = _s3_client_custom_config(
             Config(signature_version="s3v4"),
-            endpoint_url=endpoint,
+            endpoint_url=f"http://{host}",
         )
 
         s3_client.put_object(Body="test-value", Bucket=s3_bucket, Key="test")
@@ -2676,11 +3075,17 @@ class TestS3PresignedUrl:
             Params={"Bucket": s3_bucket, "Key": "test"},
             ExpiresIn=86400,
         )
-        assert f":{port1}" in presign_url
-        presign_url = presign_url.replace(f":{port1}", f":{port2}")
+        assert f":{config.EDGE_PORT}" in presign_url
 
-        response = requests.get(presign_url)
+        host_443 = host.replace(f":{config.EDGE_PORT}", ":443")
+        response = requests.get(presign_url, headers={"host": host_443})
         assert b"test-value" == response._content
+
+        if is_asf_provider():
+            # this does not work with old legacy provider, the signature does not match
+            host_no_port = host_443.replace(":443", "")
+            response = requests.get(presign_url, headers={"host": host_no_port})
+            assert b"test-value" == response._content
 
     @pytest.mark.aws_validated
     @pytest.mark.skip_snapshot_verify(
@@ -2991,7 +3396,9 @@ class TestS3PresignedUrl:
         assert response.headers.get("content-length") == str(len(body))
 
     @pytest.mark.aws_validated
-    @pytest.mark.skip_snapshot_verify(paths=["$..Expires", "$..AcceptRanges"])
+    @pytest.mark.skip_snapshot_verify(
+        condition=is_old_provider, paths=["$..Expires", "$..AcceptRanges"]
+    )
     def test_put_url_metadata(self, s3_client, s3_bucket, snapshot):
         snapshot.add_transformer(snapshot.transform.s3_api())
         # Object metadata should be passed as query params via presigned URL
@@ -3895,6 +4302,144 @@ class TestS3PresignedUrl:
         response = requests.get(_generate_presigned_url(client, simple_params, 4))
         assert response.status_code == 200
         assert response.content == data
+
+    @pytest.mark.aws_validated
+    def test_presigned_url_v4_x_amz_in_qs(
+        self,
+        s3_client,
+        s3_bucket,
+        s3_create_bucket,
+        patch_s3_skip_signature_validation_false,
+        lambda_client,
+        create_lambda_function,
+        lambda_su_role,
+        create_tmp_folder_lambda,
+    ):
+        # test that Boto does not hoist x-amz-storage-class in the query string while pre-signing
+        object_key = "temp.txt"
+        client = _s3_client_custom_config(
+            Config(signature_version="s3v4"),
+        )
+        url = client.generate_presigned_url(
+            "put_object",
+            Params={"Bucket": s3_bucket, "Key": object_key, "StorageClass": StorageClass.STANDARD},
+        )
+        assert StorageClass.STANDARD not in url
+
+        handler_file = os.path.join(
+            os.path.dirname(__file__), "../awslambda/functions/lambda_s3_integration_presign.js"
+        )
+        temp_folder = create_tmp_folder_lambda(
+            handler_file,
+            run_command="npm i @aws-sdk/util-endpoints @aws-sdk/client-s3 @aws-sdk/s3-request-presigner @aws-sdk/middleware-endpoint",
+        )
+
+        function_name = f"func-integration-{short_uid()}"
+        create_lambda_function(
+            func_name=function_name,
+            zip_file=testutil.create_zip_file(temp_folder, get_content=True),
+            runtime=LAMBDA_RUNTIME_NODEJS14X,
+            handler="lambda_s3_integration_presign.handler",
+            role=lambda_su_role,
+        )
+        s3_create_bucket(Bucket=function_name)
+
+        response = lambda_client.invoke(FunctionName=function_name)
+        presigned_url = response["Payload"].read()
+        presigned_url = json.loads(to_str(presigned_url))["body"].strip('"')
+        assert StorageClass.STANDARD in presigned_url
+
+        # missing Content-MD5
+        response = requests.put(presigned_url, verify=False, data=b"123456")
+        assert response.status_code == 403
+
+        # AWS needs the Content-MD5 header to validate the integrity of the file as set in the pre-signed URL
+        # but do not provide StorageClass in the headers, because it's not in SignedHeaders
+        response = requests.put(
+            presigned_url,
+            data=b"123456",
+            verify=False,
+            headers={"Content-MD5": "4QrcOUm6Wau+VuBX8g+IPg=="},
+        )
+        assert response.status_code == 200
+
+    @pytest.mark.aws_validated
+    @pytest.mark.skipif(
+        condition=is_old_provider(),
+        reason="behaviour not properly implemented in the legacy provider",
+    )
+    def test_presigned_url_v4_signed_headers_in_qs(
+        self,
+        s3_client,
+        s3_bucket,
+        s3_create_bucket,
+        patch_s3_skip_signature_validation_false,
+        lambda_client,
+        create_lambda_function,
+        lambda_su_role,
+        create_tmp_folder_lambda,
+    ):
+        # test that Boto does not hoist x-amz-server-side-encryption in the query string while pre-signing
+        # it means we would need to provide it in the request headers
+        object_key = "temp.txt"
+        client = _s3_client_custom_config(
+            Config(signature_version="s3v4"),
+        )
+        url = client.generate_presigned_url(
+            "put_object",
+            Params={"Bucket": s3_bucket, "Key": object_key, "ServerSideEncryption": "AES256"},
+        )
+        assert "=AES256" not in url
+
+        handler_file = os.path.join(
+            os.path.dirname(__file__), "../awslambda/functions/lambda_s3_integration_sdk_v2.js"
+        )
+        temp_folder = create_tmp_folder_lambda(
+            handler_file,
+            run_command="npm i @aws-sdk/util-endpoints @aws-sdk/client-s3 @aws-sdk/s3-request-presigner @aws-sdk/middleware-endpoint",
+        )
+
+        function_name = f"func-integration-{short_uid()}"
+        create_lambda_function(
+            func_name=function_name,
+            zip_file=testutil.create_zip_file(temp_folder, get_content=True),
+            runtime=LAMBDA_RUNTIME_NODEJS14X,
+            handler="lambda_s3_integration_sdk_v2.handler",
+            role=lambda_su_role,
+        )
+        s3_create_bucket(Bucket=function_name)
+
+        response = lambda_client.invoke(FunctionName=function_name)
+        presigned_url = response["Payload"].read()
+        presigned_url = json.loads(to_str(presigned_url))["body"].strip('"')
+        assert "=AES256" in presigned_url
+
+        # AWS needs the Content-MD5 header to validate the integrity of the file as set in the pre-signed URL
+        response = requests.put(presigned_url, verify=False, data=b"123456")
+        assert response.status_code == 403
+
+        # assert that we don't need to give x-amz-server-side-encryption even though it's in SignedHeaders,
+        # because it's in the query string
+        response = requests.put(
+            presigned_url,
+            data=b"123456",
+            verify=False,
+            headers={"Content-MD5": "4QrcOUm6Wau+VuBX8g+IPg=="},
+        )
+        assert response.status_code == 200
+
+        # assert that even if we give x-amz-server-side-encryption, as long as it's the same value as the query string,
+        # it will work
+        response = requests.put(
+            presigned_url,
+            data=b"123456",
+            verify=False,
+            headers={
+                "Content-MD5": "4QrcOUm6Wau+VuBX8g+IPg==",
+                "x-amz-server-side-encryption": "AES256",
+            },
+        )
+        assert response.status_code == 200
 
     @staticmethod
     def _get_presigned_snapshot_transformers(snapshot):
